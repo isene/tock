@@ -658,7 +658,7 @@ pub fn import_file(path: &Path, db: &Database, calendar_id: i64) -> ImportResult
 // Watch incoming
 // ---------------------------------------------------------------------------
 
-/// Scan ~/.timely/incoming/*.ics, import each file, move to processed/.
+/// Scan ~/.tock/incoming/*.ics, import each file, move to processed/.
 /// Returns the total number of events imported.
 pub fn watch_incoming(db: &Database, calendar_id: i64) -> usize {
     let incoming = incoming_dir();
@@ -701,9 +701,9 @@ pub fn watch_incoming(db: &Database, calendar_id: i64) -> usize {
     total_imported
 }
 
-/// Path to ~/.timely/incoming
+/// Path to ~/.tock/incoming
 fn incoming_dir() -> PathBuf {
-    home_dir().join(".timely").join("incoming")
+    home_dir().join(".tock").join("incoming")
 }
 
 // ---------------------------------------------------------------------------

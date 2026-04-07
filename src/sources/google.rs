@@ -39,7 +39,7 @@ impl GoogleCalendar {
             .map(String::from)
             .unwrap_or_else(|| {
                 let home = crate::config::home_dir();
-                home.join(".config/timely/credentials")
+                home.join(".config/tock/credentials")
                     .to_string_lossy()
                     .to_string()
             });

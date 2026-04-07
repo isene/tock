@@ -29,7 +29,8 @@ Terminal calendar with week view, event management, astronomy, and weather. Buil
 - **Event management**: create, edit, delete, accept invites (RSVP)
 - **Preferences**: 15 configurable settings with inline color picker (256-color grid)
 - **Calendar manager**: enable/disable calendars, change colors, remove
-- **Shared database**: uses the same SQLite DB as Timely (~/.timely/timely.db)
+- **Kastrup integration**: reply to events via Kastrup (r key), jump to Kastrup (Z key)
+- **Database**: SQLite DB in ~/.tock/tock.db (migrated from ~/.timely/)
 
 ## Install
 
@@ -74,7 +75,7 @@ cp target/release/tock ~/.local/bin/
 
 ## Configuration
 
-Config file: `~/.timely/config.yml` (shared with Timely)
+Config file: `~/.tock/config.yml`
 
 Settings include location (for astronomy/weather), work hours, calendar colors, sync intervals, and notification preferences.
 

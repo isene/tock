@@ -89,9 +89,9 @@ impl Database {
             Some(p) => PathBuf::from(p),
             None => {
                 let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-                let dir = PathBuf::from(home).join(".timely");
+                let dir = PathBuf::from(home).join(".tock");
                 std::fs::create_dir_all(&dir).ok();
-                dir.join("timely.db")
+                dir.join("tock.db")
             }
         };
 

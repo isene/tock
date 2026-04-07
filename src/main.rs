@@ -611,7 +611,13 @@ impl App {
         self.events_by_date.clear();
         for evt in &raw_events {
             let st_local = evt.start_time + tz;
-            let et_local = evt.end_time + tz;
+            // For all-day events, end_time is midnight of the next day (exclusive).
+            // Subtract 1 second so the end date doesn't spill into the next day.
+            let et_local = if evt.all_day && evt.end_time > evt.start_time {
+                evt.end_time + tz - 1
+            } else {
+                evt.end_time + tz
+            };
             let (sy2, sm2, sd2, _, _, _) = ts_to_parts(st_local);
             let (ey, em, ed, _, _, _) = ts_to_parts(et_local);
 
@@ -1314,7 +1320,7 @@ impl App {
             "C-Y" => self.copy_event_to_clipboard(),
             "v" => self.view_event_popup(),
             "a" => self.accept_invite(),
-            "r" => self.show_feedback("Reply via Heathrow: not yet implemented", 226),
+            "r" => self.reply_via_kastrup(),
             "i" => self.import_ics_file(),
             "G" => self.setup_google_calendar(),
             "O" => self.setup_outlook_calendar(),
@@ -1782,6 +1788,30 @@ impl App {
         self.show_feedback("Invite accepted", 156);
     }
 
+    fn reply_via_kastrup(&mut self) {
+        let evt = match self.event_at_selected_slot() {
+            Some(e) => e,
+            None => { self.show_feedback("No event at this time slot", 245); return; }
+        };
+        let organizer = evt.organizer.as_deref().unwrap_or("");
+        if organizer.is_empty() {
+            self.show_feedback("No organizer to reply to", 245);
+            return;
+        }
+        // Launch kastrup with compose-to argument
+        Crust::cleanup();
+        let _ = std::process::Command::new("kastrup")
+            .arg("--compose-to")
+            .arg(organizer)
+            .arg("--subject")
+            .arg(&format!("Re: {}", evt.title))
+            .status();
+        Crust::init();
+        Crust::clear_screen();
+        self.recreate_panes();
+        self.render_all();
+    }
+
     fn import_ics_file(&mut self) {
         self.blank_bottom(&style::bold(" Import ICS File"));
         let path = self.bottom_ask(" File path: ", "");
@@ -1811,7 +1841,7 @@ impl App {
         if email.trim().is_empty() { self.render_all(); return; }
         let email = email.trim().to_string();
 
-        let safe_dir = self.config.get_str("google.safe_dir", "~/.config/timely/credentials");
+        let safe_dir = self.config.get_str("google.safe_dir", "~/.config/tock/credentials");
         self.show_feedback("Connecting to Google Calendar...", 226);
 
         let _google = sources::google::GoogleCalendar::new(&email, Some(&safe_dir));
@@ -2258,7 +2288,7 @@ impl App {
     }
 
     fn check_heathrow_goto(&mut self) {
-        let goto_file = config::timely_home().join("goto");
+        let goto_file = config::tock_home().join("goto");
         if !goto_file.exists() { return; }
         if let Ok(content) = std::fs::read_to_string(&goto_file) {
             let _ = std::fs::remove_file(&goto_file);
