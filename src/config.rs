@@ -1,5 +1,5 @@
 // Tock configuration module
-// Loads/saves YAML config from ~/.timely/config.yml (shared with Ruby Timely)
+// Loads/saves YAML config from ~/.tock/config.yml
 
 use serde_yaml::Value;
 use std::fs;
@@ -14,25 +14,30 @@ pub fn home_dir() -> PathBuf {
     }
 }
 
-/// ~/.timely
-pub fn timely_home() -> PathBuf {
-    home_dir().join(".timely")
+/// ~/.tock
+pub fn tock_home() -> PathBuf {
+    home_dir().join(".tock")
 }
 
-/// ~/.timely/timely.db
-pub fn timely_db() -> PathBuf {
-    timely_home().join("timely.db")
+/// ~/.tock/tock.db
+pub fn tock_db() -> PathBuf {
+    tock_home().join("tock.db")
 }
 
-/// ~/.timely/config.yml
-pub fn timely_config() -> PathBuf {
-    timely_home().join("config.yml")
+/// ~/.tock/config.yml
+pub fn tock_config() -> PathBuf {
+    tock_home().join("config.yml")
 }
 
 /// Exported path constants (computed once, accessible as &PathBuf).
-pub static TIMELY_HOME: LazyLock<PathBuf> = LazyLock::new(timely_home);
-pub static TIMELY_DB: LazyLock<PathBuf> = LazyLock::new(timely_db);
-pub static TIMELY_CONFIG: LazyLock<PathBuf> = LazyLock::new(timely_config);
+pub static TOCK_HOME: LazyLock<PathBuf> = LazyLock::new(tock_home);
+pub static TOCK_DB: LazyLock<PathBuf> = LazyLock::new(tock_db);
+pub static TOCK_CONFIG: LazyLock<PathBuf> = LazyLock::new(tock_config);
+
+// Keep old names as aliases for compatibility with other modules
+pub fn timely_home() -> PathBuf { tock_home() }
+pub fn timely_db() -> PathBuf { tock_db() }
+pub fn timely_config() -> PathBuf { tock_config() }
 
 /// Build the default configuration as a serde_yaml::Value tree.
 fn default_config() -> Value {
@@ -49,7 +54,7 @@ work_hours:
   end: 17
 week_starts_on: monday
 google:
-  safe_dir: ~/.config/timely/credentials
+  safe_dir: ~/.config/tock/credentials
   sync_interval: 300
 outlook:
   client_id: ''
@@ -101,12 +106,12 @@ pub struct Config {
 }
 
 impl Config {
-    /// Load config from ~/.timely/config.yml.
+    /// Load config from ~/.tock/config.yml.
     /// Creates the directory and a default file if they do not exist.
     /// Merges defaults under any existing file (so new keys get added).
     pub fn new() -> Self {
-        let dir = timely_home();
-        let path = timely_config();
+        let dir = tock_home();
+        let path = tock_config();
 
         // Ensure directory exists.
         if !dir.exists() {
@@ -118,7 +123,6 @@ impl Config {
         if path.exists() {
             if let Ok(contents) = fs::read_to_string(&path) {
                 if let Ok(file_val) = serde_yaml::from_str::<Value>(&contents) {
-                    // File values override defaults.
                     deep_merge(&mut data, &file_val);
                 }
             }
@@ -132,10 +136,6 @@ impl Config {
         Config { data, path }
     }
 
-    // -- dot-path navigation helpers --
-
-    /// Resolve a dot-separated key path (e.g. "colors.saturday") to a
-    /// reference into the Value tree. Returns None if any segment is missing.
     fn resolve(&self, key_path: &str) -> Option<&Value> {
         let mut cur = &self.data;
         for seg in key_path.split('.') {
@@ -149,12 +149,10 @@ impl Config {
         Some(cur)
     }
 
-    /// Mutable resolve; creates intermediate Mappings as needed.
     fn resolve_mut(&mut self, key_path: &str) -> &mut Value {
         let segments: Vec<&str> = key_path.split('.').collect();
         let mut cur = &mut self.data;
         for seg in &segments {
-            // Ensure current node is a Mapping.
             if !cur.is_mapping() {
                 *cur = Value::Mapping(serde_yaml::Mapping::new());
             }
@@ -169,14 +167,10 @@ impl Config {
         cur
     }
 
-    // -- public getters --
-
-    /// Get a value at `key_path`. Returns `default` if the path is absent.
     pub fn get(&self, key_path: &str, default: Value) -> Value {
         self.resolve(key_path).cloned().unwrap_or(default)
     }
 
-    /// Get an i64 at `key_path`, falling back to `default`.
     pub fn get_i64(&self, key_path: &str, default: i64) -> i64 {
         match self.resolve(key_path) {
             Some(Value::Number(n)) => n.as_i64().unwrap_or(default),
@@ -184,7 +178,6 @@ impl Config {
         }
     }
 
-    /// Get an f64 at `key_path`, falling back to `default`.
     pub fn get_f64(&self, key_path: &str, default: f64) -> f64 {
         match self.resolve(key_path) {
             Some(Value::Number(n)) => n.as_f64().unwrap_or(default),
@@ -192,7 +185,6 @@ impl Config {
         }
     }
 
-    /// Get a String at `key_path`, falling back to `default`.
     pub fn get_str(&self, key_path: &str, default: &str) -> String {
         match self.resolve(key_path) {
             Some(Value::String(s)) => s.clone(),
@@ -200,7 +192,6 @@ impl Config {
         }
     }
 
-    /// Get a bool at `key_path`, falling back to `default`.
     pub fn get_bool(&self, key_path: &str, default: bool) -> bool {
         match self.resolve(key_path) {
             Some(Value::Bool(b)) => *b,
@@ -208,20 +199,11 @@ impl Config {
         }
     }
 
-    // -- setter --
-
-    /// Set a value at a dot-separated path. Intermediate maps are created
-    /// automatically if they do not exist.
     pub fn set(&mut self, key_path: &str, value: Value) {
         let slot = self.resolve_mut(key_path);
         *slot = value;
     }
 
-    // -- persistence --
-
-    /// Save config to disk. Uses merge-on-save: reads the existing file,
-    /// merges current data on top, then writes. This preserves any unknown
-    /// keys that another tool may have added.
     pub fn save(&self) -> std::io::Result<()> {
         let mut merged = if self.path.exists() {
             if let Ok(contents) = fs::read_to_string(&self.path) {
@@ -240,7 +222,6 @@ impl Config {
         fs::write(&self.path, yaml)
     }
 
-    /// Reload config from disk, merging over current defaults.
     pub fn reload(&mut self) {
         let mut data = default_config();
         if self.path.exists() {
