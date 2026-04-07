@@ -691,30 +691,42 @@ impl App {
         let date_str = format!("  {}", format_date_long(sy, sm, sd));
 
         let phase = astronomy::moon_phase(sy, sm, sd);
+        let moon_color = body_color("moon");
         let moon = format!("  {} {} ({}%)",
-            phase.symbol, phase.phase_name,
+            style::fg_rgb(phase.symbol, &moon_color), phase.phase_name,
             (phase.illumination * 100.0).round() as i32);
 
         let lat = self.config.get_f64("location.lat", 59.9139);
         let lon = self.config.get_f64("location.lon", 10.7522);
         let tz = self.config.get_f64("timezone_offset", 1.0);
 
-        let sun_str = match astronomy::sun_times(sy, sm, sd, lat, lon, tz) {
+        // Moon rise/set
+        let moon_rs = match astronomy::moon_times(sy, sm, sd, lat, lon, tz) {
             Some((rise, set)) => {
-                let sun_color = body_color("sun");
-                let sun_up = style::fg_rgb("\u{2600}", &sun_color);
-                let sun_dn = style::fg_rgb("\u{2600}", &sun_color);
-                format!("  {}\u{2191}{}  {}\u{2193}{}", sun_up, rise, sun_dn, set)
+                let mc = body_color("moon");
+                format!("  {}\u{2191}{}  {}\u{2193}{}",
+                    style::fg_rgb("\u{263D}", &mc), rise,
+                    style::fg_rgb("\u{263D}", &mc), set)
             }
             None => String::new(),
         };
 
-        // Visible planets (cached)
+        // Sun rise/set
+        let sun_str = match astronomy::sun_times(sy, sm, sd, lat, lon, tz) {
+            Some((rise, set)) => {
+                let sc = body_color("sun");
+                format!("  {}\u{2191}{}  {}\u{2193}{}",
+                    style::fg_rgb("\u{2600}", &sc), rise,
+                    style::fg_rgb("\u{2600}", &sc), set)
+            }
+            None => String::new(),
+        };
+
+        // Visible planets (cached per date)
         if self.cached_planets_date != Some(self.selected_date) {
             let planets = astronomy::visible_planets(sy, sm, sd, lat, lon, tz);
-            self.cached_planets = planets.iter().map(|(name, sym)| {
-                let color = body_color(name);
-                style::fg_rgb(sym, &color)
+            self.cached_planets = planets.iter().map(|p| {
+                style::fg_rgb(p.symbol, p.color)
             }).collect();
             self.cached_planets_date = Some(self.selected_date);
         }
@@ -724,7 +736,7 @@ impl App {
             String::new()
         };
 
-        let text = format!("{}{}{}{}{}", title, date_str, moon, sun_str, planet_str);
+        let text = format!("{}{}{}{}{}{}", title, date_str, moon, moon_rs, sun_str, planet_str);
         self.info.set_text(&text);
         self.info.refresh();
     }
@@ -733,13 +745,19 @@ impl App {
 
     fn render_status_bar(&mut self) {
         let keys = "d/D:Day  w/W:Week  m/M:Month  y/Y:Year  e/E:Event  n:New  g:GoTo  t:Today  i:Import  G:Google  O:Outlook  S:Sync  C:Cal  P:Prefs  ?:Help  q:Quit";
+        let version = format!("tock v{}", env!("CARGO_PKG_VERSION"));
+        let w = self.cols as usize;
         if self.syncing {
             let sync_ind = style::fg(" Syncing...", 226);
-            let pad_len = (self.cols as usize).saturating_sub(keys.len() + 12).max(1);
-            let text = format!(" {}{}{}", keys, " ".repeat(pad_len), sync_ind);
+            let used = keys.len() + 12 + version.len() + 2;
+            let pad_len = w.saturating_sub(used).max(1);
+            let text = format!(" {}{}{} {}", keys, " ".repeat(pad_len), sync_ind, version);
             self.status.set_text(&text);
         } else {
-            self.status.set_text(&format!(" {}", keys));
+            let used = keys.len() + version.len() + 3;
+            let pad_len = w.saturating_sub(used).max(1);
+            let text = format!(" {}{}{}", keys, " ".repeat(pad_len), version);
+            self.status.set_text(&text);
         }
         self.status.refresh();
     }
@@ -936,8 +954,9 @@ impl App {
 
         // Day headers
         let wk = cweek(week_start.0, week_start.1, week_start.2);
-        let wk_str = style::fg(&format!("W{}", wk), 238);
-        let wk_pad = time_col.saturating_sub(display_width(&wk_str) + 1).max(0);
+        let wk_label = format!("W{}", wk);
+        let wk_str = style::fg(&wk_label, 238);
+        let wk_pad = time_col.saturating_sub(wk_label.len()).max(1);
         let mut header_parts = vec![format!("{}{}", wk_str, " ".repeat(wk_pad))];
 
         for i in 0..7 {
@@ -951,26 +970,19 @@ impl App {
                 else if day_wd == 6 { sat_color }
                 else { 245 };
 
+            let pure_len = header_text.len();
+            let pad = day_col.saturating_sub(pure_len);
             let (header, pad_str) = if is_sel && is_today {
-                let h = style::bg(&style::underline(&style::bold(&style::fg(&header_text, today_fg))), today_bg);
-                let pure_len = header_text.len();
-                let pad = day_col.saturating_sub(pure_len);
+                let h = style::bg(&style::fg(&style::underline(&style::bold(&header_text)), today_fg), today_bg);
                 (h, style::bg(&" ".repeat(pad), today_bg))
             } else if is_sel {
-                let h = style::bg(&style::underline(&style::bold(&style::fg(&header_text, base_color))), sel_alt_a);
-                let pure_len = header_text.len();
-                let pad = day_col.saturating_sub(pure_len);
+                let h = style::bg(&style::fg(&style::underline(&style::bold(&header_text)), base_color), sel_alt_a);
                 (h, style::bg(&" ".repeat(pad), sel_alt_a))
             } else if is_today {
-                let h = style::bg(&style::underline(&style::bold(&style::fg(&header_text, today_fg))), today_bg);
-                let pure_len = header_text.len();
-                let pad = day_col.saturating_sub(pure_len);
+                let h = style::bg(&style::fg(&style::bold(&header_text), today_fg), today_bg);
                 (h, style::bg(&" ".repeat(pad), today_bg))
             } else {
-                let h = style::fg(&header_text, base_color);
-                let pure_len = header_text.len();
-                let pad = day_col.saturating_sub(pure_len);
-                (h, " ".repeat(pad))
+                (style::fg(&header_text, base_color), " ".repeat(pad))
             };
             header_parts.push(format!("{}{}", header, pad_str));
         }
@@ -1016,8 +1028,8 @@ impl App {
                         let color = evt.calendar_color as u8;
                         let marker = if is_at { ">" } else { " " };
                         let entry = format!("{}{}", marker, truncate_str(title, day_col.saturating_sub(1)));
-                        if let Some(bg) = cell_bg {
-                            style::bg(&style::bold(&style::fg(&entry, color)), bg)
+                        if let Some(bg_c) = cell_bg {
+                            style::bg(&style::bold(&style::fg(&entry, color)), bg_c)
                         } else {
                             style::fg(&entry, color)
                         }
