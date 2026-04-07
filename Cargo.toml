@@ -1,0 +1,22 @@
+[package]
+name = "tock"
+version = "0.1.0"
+edition = "2021"
+authors = ["Geir Isene <g@isene.com>"]
+description = "Terminal calendar TUI. Feature clone of Timely, built on crust."
+license = "Unlicense"
+repository = "https://github.com/isene/tock"
+
+[dependencies]
+crust = { version = "0.1", path = "../crust", package = "fe2o3-crust" }
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+ureq = { version = "2", features = ["tls", "json"] }
+regex = "1"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
