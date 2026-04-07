@@ -77,9 +77,6 @@ fn poller_loop(
     running: &AtomicBool,
     tx: &mpsc::Sender<PollerEvent>,
 ) {
-    // Number of 2-second sleep ticks per half-interval.
-    let ticks = (interval_secs / 2).max(1);
-
     while running.load(Ordering::SeqCst) {
         let any_new = run_sync_cycle(db);
 
@@ -87,15 +84,14 @@ fn poller_loop(
             let _ = tx.send(PollerEvent::NeedsRefresh);
         }
 
-        // Fire desktop notifications for upcoming events.
         notifications::check_and_notify(db, default_alarm);
 
-        // Sleep in short intervals so we can respond to stop quickly.
-        for _ in 0..ticks {
+        // Sleep in 1s ticks for low CPU, fast shutdown response
+        for _ in 0..interval_secs {
             if !running.load(Ordering::SeqCst) {
                 return;
             }
-            thread::sleep(Duration::from_secs(2));
+            thread::sleep(Duration::from_secs(1));
         }
     }
 }

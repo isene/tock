@@ -8,6 +8,8 @@
 
 Terminal calendar with week view, event management, astronomy, and weather. Built on [Crust](https://github.com/isene/crust). Feature clone of [Timely](https://github.com/isene/Timely) rewritten in Rust for speed and single-binary distribution.
 
+![Tock screenshot](img/screenshot.png)
+
 ## Features
 
 - **5-pane TUI**: info bar, mini-month strip, week view grid, event details, status bar
@@ -16,7 +18,12 @@ Terminal calendar with week view, event management, astronomy, and weather. Buil
 - **Calendar sources**: Google Calendar (OAuth2), Outlook/365 (device auth), local events
 - **ICS import**: parse and import .ics files with RRULE expansion for recurring events
 - **Background sync**: automatic polling with configurable intervals
-- **Astronomy**: moon phase with emoji symbols, sunrise/sunset, solstices, meteor showers
+- **Ephemeris engine**: full planetary position calculator ported from [ruby-ephemeris](https://github.com/isene/ephemeris)
+  - Moon phase with emoji symbols, illumination percentage
+  - Moon rise/set times
+  - Sunrise/sunset times
+  - Visible planets (Mercury, Venus, Mars, Jupiter, Saturn) with rise/set
+  - Solstices, equinoxes, 11 meteor shower peaks
 - **Weather**: 7-day forecast from Met.no (free, no API key)
 - **Desktop notifications**: configurable alarms via notify-send
 - **Event management**: create, edit, delete, accept invites (RSVP)
