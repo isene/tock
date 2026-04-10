@@ -1880,11 +1880,87 @@ impl App {
 
         self.syncing = true;
         self.render_status_bar();
+        self.show_feedback("Syncing...", 156);
 
-        // Sync runs in background via poller; trigger a refresh
-        self.show_feedback("Sync triggered. Background poller will refresh.", 156);
+        // Run sync directly on main thread for immediate feedback
+        let now = crate::database::now_secs();
+        let range_start = now - 90 * 86400;
+        let range_end = now + 90 * 86400;
+        let mut any_new = false;
+
+        for cal in &google_cals {
+            let cfg_str = match &cal.source_config { Some(s) => s.clone(), None => continue };
+            let config: serde_json::Value = match serde_json::from_str(&cfg_str) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let email = config.get("email").and_then(|v| v.as_str()).unwrap_or("");
+            let safe_dir = config.get("safe_dir").and_then(|v| v.as_str());
+            let gcid = config.get("google_calendar_id").and_then(|v| v.as_str()).unwrap_or("");
+            let mut gc = crate::sources::google::GoogleCalendar::new(email, safe_dir);
+            if gc.get_access_token().is_none() {
+                let err = gc.last_error.as_deref().unwrap_or("auth failed");
+                self.show_feedback(&format!("Google sync {}: {}", cal.name, err), 196);
+                continue;
+            }
+            let tmin = crate::sources::google::ts_to_rfc3339_pub(range_start);
+            let tmax = crate::sources::google::ts_to_rfc3339_pub(range_end);
+            if let Some(events) = gc.fetch_events(gcid, &tmin, &tmax) {
+                for mut ev in events {
+                    ev.calendar_id = cal.id;
+                    if let Ok(crate::database::SyncResult::New | crate::database::SyncResult::Updated) =
+                        self.db.upsert_synced_event(cal.id, &ev)
+                    {
+                        any_new = true;
+                    }
+                }
+                let _ = self.db.update_calendar_sync(cal.id, now, None);
+            }
+        }
+
+        for cal in &outlook_cals {
+            let cfg_str = match &cal.source_config { Some(s) => s.clone(), None => continue };
+            let mut config: serde_json::Value = match serde_json::from_str(&cfg_str) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let mut oc = crate::sources::outlook::OutlookCalendar::new(&config);
+            if oc.refresh_access_token().is_none() {
+                let err = oc.last_error.as_deref().unwrap_or("auth failed");
+                self.show_feedback(&format!("Outlook sync {}: {}", cal.name, err), 196);
+                continue;
+            }
+            let tmin = crate::sources::google::ts_to_rfc3339_pub(range_start);
+            let tmax = crate::sources::google::ts_to_rfc3339_pub(range_end);
+            if let Some(events) = oc.fetch_events(&tmin, &tmax) {
+                for mut ev in events {
+                    ev.calendar_id = cal.id;
+                    if let Ok(crate::database::SyncResult::New | crate::database::SyncResult::Updated) =
+                        self.db.upsert_synced_event(cal.id, &ev)
+                    {
+                        any_new = true;
+                    }
+                }
+                let new_cfg = if let Some(rt) = oc.get_refresh_token() {
+                    config["refresh_token"] = serde_json::json!(rt);
+                    if let Some(at) = oc.get_access_token_cached() {
+                        config["access_token"] = serde_json::json!(at);
+                    }
+                    Some(serde_json::to_string(&config).unwrap_or_default())
+                } else { None };
+                let _ = self.db.update_calendar_sync(cal.id, now, new_cfg.as_deref());
+            }
+        }
+
         self.syncing = false;
-        self.render_status_bar();
+        if any_new {
+            self.load_events_for_range();
+            self.render_all();
+            self.show_feedback("Sync complete, new events loaded", 156);
+        } else {
+            self.render_status_bar();
+            self.show_feedback("Sync complete, no changes", 245);
+        }
     }
 
     fn show_calendars(&mut self) {

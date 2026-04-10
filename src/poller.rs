@@ -139,54 +139,134 @@ fn run_sync_cycle(db: &Database) -> bool {
 // Google sync stub
 // ---------------------------------------------------------------------------
 
-/// Sync a single Google calendar. Returns true if new events were inserted.
-///
-/// Once `sources::google` is implemented this will call:
-///   GoogleCalendar::new(source_config) -> get_access_token -> fetch_events
-/// For now this is a no-op placeholder that returns false.
 fn sync_google_calendar(
     db: &Database,
     cal: &crate::database::Calendar,
-    _range_start: i64,
-    _range_end: i64,
+    range_start: i64,
+    range_end: i64,
 ) -> bool {
-    // TODO: integrate with sources::google once implemented.
-    // Expected flow:
-    //   1. Parse source_config JSON for client credentials / refresh token
-    //   2. Create GoogleCalendar, obtain access token
-    //   3. Fetch events in [range_start, range_end]
-    //   4. For each event: db.upsert_synced_event(cal.id, &event_data)
-    //   5. Persist refreshed token: db.update_calendar_sync(...)
-    //   6. Return true if any SyncResult::New
+    use crate::sources::google::GoogleCalendar;
 
-    let _ = (db, cal);
-    false
+    let cfg_str = match &cal.source_config {
+        Some(s) => s.clone(),
+        None => return false,
+    };
+    let config: serde_json::Value = match serde_json::from_str(&cfg_str) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    let email = match config.get("email").and_then(|v| v.as_str()) {
+        Some(e) => e,
+        None => return false,
+    };
+    let safe_dir = config.get("safe_dir").and_then(|v| v.as_str());
+    let google_calendar_id = match config.get("google_calendar_id").and_then(|v| v.as_str()) {
+        Some(id) => id,
+        None => return false,
+    };
+
+    let mut gc = GoogleCalendar::new(email, safe_dir);
+    if gc.get_access_token().is_none() {
+        return false;
+    }
+
+    let time_min = ts_to_rfc3339(range_start);
+    let time_max = ts_to_rfc3339(range_end);
+
+    let events = match gc.fetch_events(google_calendar_id, &time_min, &time_max) {
+        Some(evts) => evts,
+        None => return false,
+    };
+
+    let mut any_new = false;
+    for mut ev in events {
+        ev.calendar_id = cal.id;
+        match db.upsert_synced_event(cal.id, &ev) {
+            Ok(SyncResult::New) => any_new = true,
+            Ok(SyncResult::Updated) => any_new = true,
+            _ => {}
+        }
+    }
+
+    let _ = db.update_calendar_sync(cal.id, now_secs(), None);
+    any_new
+}
+
+fn ts_to_rfc3339(ts: i64) -> String {
+    let secs_in_day = 86400_i64;
+    let days_raw = ts.div_euclid(secs_in_day);
+    let day_secs = ts.rem_euclid(secs_in_day);
+    let h = day_secs / 3600;
+    let m = (day_secs % 3600) / 60;
+    let s = day_secs % 60;
+    let d2 = days_raw + 719468;
+    let era = if d2 >= 0 { d2 } else { d2 - 146096 } / 146097;
+    let doe = d2 - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let mon = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if mon <= 2 { 1 } else { 0 };
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mon, day, h, m, s)
 }
 
 // ---------------------------------------------------------------------------
 // Outlook sync stub
 // ---------------------------------------------------------------------------
 
-/// Sync a single Outlook calendar. Returns true if new events were inserted.
-///
-/// Once `sources::outlook` is implemented this will call:
-///   OutlookCalendar::new(source_config) -> refresh_token -> fetch_events
-/// For now this is a no-op placeholder that returns false.
 fn sync_outlook_calendar(
     db: &Database,
     cal: &crate::database::Calendar,
-    _range_start: i64,
-    _range_end: i64,
+    range_start: i64,
+    range_end: i64,
 ) -> bool {
-    // TODO: integrate with sources::outlook once implemented.
-    // Expected flow:
-    //   1. Parse source_config JSON for client_id / tenant / refresh token
-    //   2. Create OutlookCalendar, refresh token via OAuth
-    //   3. Fetch events in [range_start, range_end]
-    //   4. For each event: db.upsert_synced_event(cal.id, &event_data)
-    //   5. Persist refreshed token: db.update_calendar_sync(...)
-    //   6. Return true if any SyncResult::New
+    use crate::sources::outlook::OutlookCalendar;
 
-    let _ = (db, cal);
-    false
+    let cfg_str = match &cal.source_config {
+        Some(s) => s.clone(),
+        None => return false,
+    };
+    let mut config: serde_json::Value = match serde_json::from_str(&cfg_str) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    let mut oc = OutlookCalendar::new(&config);
+    if oc.refresh_access_token().is_none() {
+        return false;
+    }
+
+    let time_min = ts_to_rfc3339(range_start);
+    let time_max = ts_to_rfc3339(range_end);
+
+    let events = match oc.fetch_events(&time_min, &time_max) {
+        Some(evts) => evts,
+        None => return false,
+    };
+
+    let mut any_new = false;
+    for mut ev in events {
+        ev.calendar_id = cal.id;
+        match db.upsert_synced_event(cal.id, &ev) {
+            Ok(SyncResult::New) => any_new = true,
+            Ok(SyncResult::Updated) => any_new = true,
+            _ => {}
+        }
+    }
+
+    // Persist refreshed tokens back to source_config
+    let new_config = if let Some(new_refresh) = oc.get_refresh_token() {
+        config["refresh_token"] = serde_json::json!(new_refresh);
+        if let Some(access) = oc.get_access_token_cached() {
+            config["access_token"] = serde_json::json!(access);
+        }
+        Some(serde_json::to_string(&config).unwrap_or_default())
+    } else {
+        None
+    };
+
+    let _ = db.update_calendar_sync(cal.id, now_secs(), new_config.as_deref());
+    any_new
 }

@@ -60,6 +60,14 @@ impl OutlookCalendar {
         }
     }
 
+    pub fn get_refresh_token(&self) -> Option<&str> {
+        self.refresh_token.as_deref()
+    }
+
+    pub fn get_access_token_cached(&self) -> Option<&str> {
+        self.access_token.as_deref()
+    }
+
     fn auth_url(&self, endpoint: &str) -> String {
         format!("{}/{}/oauth2/v2.0/{}", AUTH_BASE, self.tenant_id, endpoint)
     }
