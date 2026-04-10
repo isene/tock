@@ -624,7 +624,9 @@ fn parse_date_str(s: &str) -> i64 {
     parse_rfc3339(&format!("{}T00:00:00Z", &s[..10]))
 }
 
-/// Format a UNIX timestamp as "YYYY-MM-DDTHH:MM:SSZ".
+/// Format a UNIX timestamp as "YYYY-MM-DDTHH:MM:SSZ" (public for use in manual sync).
+pub fn ts_to_rfc3339_pub(ts: i64) -> String { ts_to_rfc3339(ts) }
+
 fn ts_to_rfc3339(ts: i64) -> String {
     let secs_in_day = 86400_i64;
     let mut days = ts.div_euclid(secs_in_day);
