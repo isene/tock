@@ -1582,7 +1582,42 @@ impl App {
             None => { self.show_feedback("No event at this time slot", 245); return; }
         };
 
+        // Is this part of a recurring series? Either it's the master
+        // (recurrence_rule set) or an expanded occurrence (series_master_id set).
+        let is_series = evt.recurrence_rule.as_ref().map(|r| !r.is_empty()).unwrap_or(false)
+            || evt.series_master_id.is_some();
+
         self.blank_bottom(&style::bold(" Delete Event"));
+        if is_series {
+            let choice = self.bottom_ask(
+                &format!(" Delete '{}': (o)ccurrence / (s)eries / (n)o: ", evt.title),
+                "",
+            );
+            match choice.trim().to_lowercase().as_str() {
+                "o" | "occurrence" => {
+                    let _ = self.db.delete_event(evt.id);
+                    self.load_events_for_range();
+                    self.render_all();
+                    self.show_feedback("Occurrence deleted", 156);
+                }
+                "s" | "series" => {
+                    match self.db.delete_event_series(evt.id) {
+                        Ok(n) => {
+                            self.load_events_for_range();
+                            self.render_all();
+                            self.show_feedback(&format!("Series deleted ({} row(s))", n), 156);
+                        }
+                        Err(e) => {
+                            self.render_all();
+                            self.show_feedback(&format!("Delete failed: {}", e), 196);
+                        }
+                    }
+                }
+                _ => { self.render_all(); self.show_feedback("Cancelled", 245); }
+            }
+            return;
+        }
+
         let confirm = self.bottom_ask(&format!(" Delete '{}'? (y/n): ", evt.title), "");
         if confirm.trim().to_lowercase() != "y" { self.render_all(); return; }
 

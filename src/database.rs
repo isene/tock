@@ -362,6 +362,33 @@ impl Database {
         Ok(())
     }
 
+    /// Delete the master row and all expanded occurrences of a series. Pass
+    /// either the master's id or any occurrence's id — the method resolves to
+    /// the real master via series_master_id when needed. Returns the number
+    /// of rows removed.
+    pub fn delete_event_series(&self, id: i64) -> rusqlite::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        // Resolve to the master id: if this row has series_master_id set,
+        // that points at the master; otherwise this row IS the master.
+        let master_id: i64 = conn
+            .query_row(
+                "SELECT COALESCE(series_master_id, id) FROM events WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap_or(id);
+        let mut removed = 0usize;
+        removed += conn.execute(
+            "DELETE FROM events WHERE series_master_id = ?1",
+            params![master_id],
+        )?;
+        removed += conn.execute(
+            "DELETE FROM events WHERE id = ?1",
+            params![master_id],
+        )?;
+        Ok(removed)
+    }
+
     // -----------------------------------------------------------------------
     // Calendar CRUD
     // -----------------------------------------------------------------------
