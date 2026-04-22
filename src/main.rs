@@ -1044,7 +1044,9 @@ impl App {
                         let title = if evt.title.is_empty() { "(No title)" } else { &evt.title };
                         let color = evt.calendar_color as u8;
                         let marker = if is_at { ">" } else { " " };
-                        let entry = format!("{}{}", marker, truncate_str(title, day_col.saturating_sub(1)));
+                        let rsvp = rsvp_marker(evt.my_status.as_deref());
+                        let labeled = if rsvp.is_empty() { title.to_string() } else { format!("{} {}", rsvp, title) };
+                        let entry = format!("{}{}", marker, truncate_str(&labeled, day_col.saturating_sub(1)));
                         if let Some(bg_c) = cell_bg {
                             style::bg(&style::bold(&style::fg(&entry, color)), bg_c)
                         } else {
@@ -1119,7 +1121,9 @@ impl App {
                     let is_at_slot = is_sel && is_slot_selected;
                     let marker = if is_at_slot { ">" } else { " " };
                     let title = if evt.title.is_empty() { "(No title)" } else { &evt.title };
-                    let mut entry = format!("{}{}", marker, title);
+                    let rsvp = rsvp_marker(evt.my_status.as_deref());
+                    let labeled = if rsvp.is_empty() { title.to_string() } else { format!("{} {}", rsvp, title) };
+                    let mut entry = format!("{}{}", marker, labeled);
                     if entry.len() > day_col {
                         entry = format!("{}.", truncate_str(&entry, day_col.saturating_sub(1)));
                     }
@@ -1162,7 +1166,9 @@ impl App {
         let evt = self.event_at_selected_slot();
         if let Some(evt) = evt {
             let color = evt.calendar_color as u8;
-            let title = if evt.title.is_empty() { "(No title)".to_string() } else { evt.title.clone() };
+            let title_only = if evt.title.is_empty() { "(No title)".to_string() } else { evt.title.clone() };
+            let rsvp = rsvp_marker(evt.my_status.as_deref());
+            let title = if rsvp.is_empty() { title_only } else { format!("{} {}", rsvp, title_only) };
             let tz = local_tz_offset_secs();
 
             let time_info = if evt.all_day {
@@ -2419,6 +2425,18 @@ fn body_color(name: &str) -> String {
         if n == name { return c.to_string(); }
     }
     "888888".to_string()
+}
+
+/// Subtle single-glyph RSVP marker: a dot for "accepted" / "organizer",
+/// "?" for tentative, "×" for declined. Empty for unresponded or missing.
+fn rsvp_marker(my_status: Option<&str>) -> &'static str {
+    match my_status {
+        Some("accepted")                                 => "•",
+        Some("organizer")                                => "∘",
+        Some("tentative") | Some("tentativelyAccepted") => "?",
+        Some("declined")                                 => "×",
+        _                                                => "",
+    }
 }
 
 fn humanize_status(status: &str) -> &str {
