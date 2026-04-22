@@ -610,16 +610,27 @@ impl App {
 
         self.events_by_date.clear();
         for evt in &raw_events {
-            let st_local = evt.start_time + tz;
-            // For all-day events, end_time is midnight of the next day (exclusive).
-            // Subtract 1 second so the end date doesn't spill into the next day.
-            let et_local = if evt.all_day && evt.end_time > evt.start_time {
-                evt.end_time + tz - 1
+            // All-day events are stored as UTC midnight per the iCal/Google/Outlook
+            // floating-date convention — they are DATES, not timestamps. Applying a
+            // local-TZ shift pushes the (exclusive) end into the next day; don't.
+            // Timed events do need the shift so their wall-clock date is right.
+            let (sy2, sm2, sd2) = if evt.all_day {
+                let (y, m, d, _, _, _) = ts_to_parts(evt.start_time);
+                (y, m, d)
             } else {
-                evt.end_time + tz
+                let (y, m, d, _, _, _) = ts_to_parts(evt.start_time + tz);
+                (y, m, d)
             };
-            let (sy2, sm2, sd2, _, _, _) = ts_to_parts(st_local);
-            let (ey, em, ed, _, _, _) = ts_to_parts(et_local);
+            let (ey, em, ed) = if evt.all_day {
+                // Exclusive end → subtract 1 second before extracting the date,
+                // so a May 23 → May 28 (exclusive) event ends on May 27.
+                let end_ts = if evt.end_time > evt.start_time { evt.end_time - 1 } else { evt.start_time };
+                let (y, m, d, _, _, _) = ts_to_parts(end_ts);
+                (y, m, d)
+            } else {
+                let (y, m, d, _, _, _) = ts_to_parts(evt.end_time + tz);
+                (y, m, d)
+            };
 
             let mut cur = (sy2, sm2, sd2);
             let end_date = (ey, em, ed);
