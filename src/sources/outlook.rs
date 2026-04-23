@@ -522,13 +522,17 @@ fn normalize_event(item: &Value) -> EventData {
         .unwrap_or("(no subject)")
         .to_string();
 
-    let description = item.get("bodyPreview")
+    // Prefer the full body.content — bodyPreview is Microsoft Graph's
+    // 255-char truncated summary and cuts mid-word on anything longer.
+    // clean_description at render time strips HTML so storing raw HTML
+    // here is fine.
+    let description = item.get("body")
+        .and_then(|b| b.get("content"))
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(String::from)
         .or_else(|| {
-            item.get("body")
-                .and_then(|b| b.get("content"))
+            item.get("bodyPreview")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(String::from)
