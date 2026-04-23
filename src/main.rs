@@ -1337,6 +1337,9 @@ impl App {
             "C-Y" => self.copy_event_to_clipboard(),
             "v" => self.view_event_popup(),
             "a" => self.accept_invite(),
+            "A" => self.decline_invite(),
+            "T" => self.tentative_invite(),
+            "F" => self.show_free_busy(),
             "r" => self.reply_via_kastrup(),
             "i" => self.import_ics_file(),
             "G" => self.setup_google_calendar(),
@@ -1805,13 +1808,51 @@ impl App {
         self.render_all();
     }
 
-    fn accept_invite(&mut self) {
+    #[allow(dead_code)]
+    fn accept_invite(&mut self)    { self.rsvp_invite("accept"); }
+    fn decline_invite(&mut self)   { self.rsvp_invite("decline"); }
+    fn tentative_invite(&mut self) { self.rsvp_invite("tentative"); }
+
+    /// Update the local RSVP state AND notify the organizer via the
+    /// calendar backend when possible. Currently propagates for Outlook
+    /// (Microsoft Graph `/me/events/{id}/{accept|decline|tentativelyAccept}`);
+    /// Google and local calendars only update the local my_status for now.
+    fn rsvp_invite(&mut self, response: &str) {
         let evt = match self.event_at_selected_slot() {
             Some(e) => e,
             None => { self.show_feedback("No event at this time slot", 245); return; }
         };
 
-        self.show_feedback(&format!("Accepting '{}'...", evt.title), 226);
+        let (verb_ing, my_status_value) = match response {
+            "accept"    => ("Accepting",  "accepted"),
+            "decline"   => ("Declining",  "declined"),
+            "tentative" => ("Tentatively accepting", "tentativelyAccepted"),
+            _ => { self.show_feedback(&format!("Unknown RSVP: {}", response), 196); return; }
+        };
+        self.show_feedback(&format!("{} '{}'...", verb_ing, evt.title), 226);
+
+        // Resolve the calendar so we know which backend to talk to.
+        let cal_source_type = self.db.get_calendars(false).ok()
+            .and_then(|cals| cals.into_iter().find(|c| c.id == evt.calendar_id))
+            .map(|c| (c.source_type, c.source_config));
+
+        let mut graph_ok = None::<bool>;
+        if let Some((ref stype, Some(ref cfg_str))) = cal_source_type {
+            if stype == "outlook" {
+                if let Ok(config) = serde_json::from_str::<serde_json::Value>(cfg_str) {
+                    let mut oc = crate::sources::outlook::OutlookCalendar::new(&config);
+                    if oc.refresh_access_token().is_some() {
+                        if let Some(ref ext) = evt.external_id {
+                            graph_ok = Some(oc.respond_to_event(ext, response));
+                        } else {
+                            graph_ok = Some(false);
+                        }
+                    } else {
+                        graph_ok = Some(false);
+                    }
+                }
+            }
+        }
 
         let data = EventData {
             id: Some(evt.id),
@@ -1829,15 +1870,120 @@ impl App {
             status: evt.status.clone(),
             organizer: evt.organizer.clone(),
             attendees: evt.attendees.clone(),
-            my_status: Some("accepted".to_string()),
+            my_status: Some(my_status_value.to_string()),
             alarms: evt.alarms.clone(),
             metadata: evt.metadata.clone(),
         };
-
         let _ = self.db.save_event(&data);
         self.load_events_for_range();
         self.render_all();
-        self.show_feedback("Invite accepted", 156);
+
+        let msg = match graph_ok {
+            Some(true)  => format!("{} (organizer notified)", humanize_status(my_status_value)),
+            Some(false) => format!("{} locally — Graph call failed", humanize_status(my_status_value)),
+            None        => format!("{} locally — no propagation for this calendar", humanize_status(my_status_value)),
+        };
+        let color = if matches!(graph_ok, Some(false)) { 196 } else { 156 };
+        self.show_feedback(&msg, color);
+    }
+
+    /// Free/busy overlay: prompt for comma-separated emails, call Microsoft
+    /// Graph getSchedule against the first configured Outlook calendar, and
+    /// render a compact grid in the bottom pane. One row per person, one
+    /// column per 30-min slot from 08:00 to 18:00 on the currently selected
+    /// day (so 20 cells per person). Cell legend: · free, ~ tentative,
+    /// █ busy, ◎ OOF, e elsewhere.
+    fn show_free_busy(&mut self) {
+        let emails_raw = self.bottom_ask(" Emails (comma-separated): ", "");
+        let emails_raw = emails_raw.trim().to_string();
+        if emails_raw.is_empty() {
+            self.render_all();
+            return;
+        }
+        let emails: Vec<String> = emails_raw
+            .split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        if emails.is_empty() {
+            self.show_feedback("No emails provided", 245);
+            return;
+        }
+
+        // First Outlook calendar (getSchedule is a per-user API; any auth works).
+        let oc_config = match self.db.get_calendars(false).ok().and_then(|cals| {
+            cals.into_iter()
+                .find(|c| c.source_type == "outlook")
+                .and_then(|c| c.source_config)
+        }) {
+            Some(cfg) => cfg,
+            None => { self.show_feedback("No Outlook calendar configured (need it for getSchedule)", 196); return; }
+        };
+        let config: serde_json::Value = match serde_json::from_str(&oc_config) {
+            Ok(v) => v,
+            Err(e) => { self.show_feedback(&format!("Bad Outlook config: {}", e), 196); return; }
+        };
+        let mut oc = crate::sources::outlook::OutlookCalendar::new(&config);
+        if oc.refresh_access_token().is_none() {
+            self.show_feedback(&format!("Graph auth failed: {}",
+                oc.last_error.as_deref().unwrap_or("unknown")), 196);
+            return;
+        }
+
+        // Window: 08:00 to 18:00 local on the selected day, 30-min slots.
+        let (sy, sm, sd) = self.selected_date;
+        let start = format!("{:04}-{:02}-{:02}T08:00:00", sy, sm, sd);
+        let end   = format!("{:04}-{:02}-{:02}T18:00:00", sy, sm, sd);
+        let tz = std::env::var("TZ").unwrap_or_else(|_| "Europe/Oslo".to_string());
+
+        self.show_feedback(&format!("Fetching schedule for {} people...", emails.len()), 226);
+        let schedules = match oc.get_schedule(&emails, &start, &end, &tz, 30) {
+            Some(s) => s,
+            None => { self.show_feedback(&format!("getSchedule failed: {}",
+                oc.last_error.as_deref().unwrap_or("no response")), 196); return; }
+        };
+
+        // Render grid. 20 half-hour slots from 08:00 to 18:00.
+        // Columns: time header (08:00 marker every 2 slots).
+        let mut lines: Vec<String> = Vec::new();
+        lines.push(style::bold(&format!(
+            " Availability for {:04}-{:02}-{:02}  08:00-18:00  (30-min slots)",
+            sy, sm, sd)));
+        lines.push(String::new());
+        // Hour-tick header.
+        let mut header = String::from(format!(" {:>28}  ", ""));
+        for slot in 0..20 {
+            if slot % 2 == 0 {
+                let hour = 8 + (slot / 2);
+                header.push_str(&format!("{:02}", hour));
+            } else {
+                header.push_str("  ");
+            }
+        }
+        lines.push(style::fg(&header, 240));
+
+        for entry in &schedules {
+            let mut row = format!(" {:>28}  ", truncate_str(&entry.email, 28));
+            for ch in entry.availability_view.chars() {
+                let glyph = match ch {
+                    '0' => style::fg("·", 108),  // free (muted green)
+                    '1' => style::fg("~", 220),  // tentative
+                    '2' => style::fg("\u{2588}", 167), // busy (red block)
+                    '3' => style::fg("\u{25CE}", 208), // OOF
+                    '4' => style::fg("e", 117),        // working elsewhere
+                    _   => "?".to_string(),
+                };
+                // Display a single column per slot + padding inside header.
+                row.push_str(&glyph);
+                row.push(' ');
+            }
+            lines.push(row);
+        }
+        lines.push(String::new());
+        lines.push(style::fg(
+            "  ·=free  ~=tentative  █=busy  ◎=OOF  e=elsewhere    (F again to refresh, any key to dismiss)",
+            240));
+
+        self.bottom.say(&lines.join("\n"));
+        let _ = crust::Input::getchr(None);
+        self.render_all();
     }
 
     fn reply_via_kastrup(&mut self) {

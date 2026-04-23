@@ -25,6 +25,13 @@ pub struct TokenResult {
     pub refresh_token: Option<String>,
 }
 
+/// One row of the `/me/calendar/getSchedule` response: an email and its
+/// compact availability string (one character per slot).
+pub struct ScheduleEntry {
+    pub email: String,
+    pub availability_view: String,
+}
+
 pub struct OutlookCalendar {
     client_id: String,
     tenant_id: String,
@@ -364,6 +371,39 @@ impl OutlookCalendar {
     pub fn delete_event(&mut self, event_id: &str) -> bool {
         let path = format!("/me/events/{}", event_id);
         self.api_delete(&path)
+    }
+
+    /// Microsoft Graph `/me/calendar/getSchedule`. Returns one entry per
+    /// email with an `availability_view` string — a char per slot where
+    /// '0' = free, '1' = tentative, '2' = busy, '3' = out-of-office,
+    /// '4' = working elsewhere. Callers render as a grid.
+    ///
+    /// `start`/`end` are local wall-clock RFC3339 strings without offset
+    /// (Graph interprets them in the supplied `time_zone`). `interval`
+    /// is the slot width in minutes (typically 30 or 60).
+    pub fn get_schedule(
+        &mut self,
+        emails: &[String],
+        start: &str,
+        end: &str,
+        time_zone: &str,
+        interval_minutes: u32,
+    ) -> Option<Vec<ScheduleEntry>> {
+        let body = json!({
+            "schedules": emails,
+            "startTime": { "dateTime": start, "timeZone": time_zone },
+            "endTime":   { "dateTime": end,   "timeZone": time_zone },
+            "availabilityViewInterval": interval_minutes,
+        });
+        let resp = self.api_post("/me/calendar/getSchedule", &body)?;
+        let arr = resp.get("value")?.as_array()?;
+        let mut out = Vec::with_capacity(arr.len());
+        for item in arr {
+            let email = item.get("scheduleId").and_then(Value::as_str).unwrap_or("").to_string();
+            let view = item.get("availabilityView").and_then(Value::as_str).unwrap_or("").to_string();
+            out.push(ScheduleEntry { email, availability_view: view });
+        }
+        Some(out)
     }
 
     pub fn respond_to_event(&mut self, event_id: &str, response: &str) -> bool {
