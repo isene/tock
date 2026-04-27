@@ -1430,6 +1430,82 @@ impl App {
         None
     }
 
+    /// If `cal` is a remote-source calendar (google / outlook), push the
+    /// just-saved event up. For new events (no external_id yet), the
+    /// remote create returns an id which we persist back. Returns true
+    /// when a remote push happened (success or attempted), false when
+    /// the calendar is local-only.
+    fn push_event_remote(&mut self, cal: &crate::database::Calendar,
+                          local_id: i64, mut data: EventData) -> bool {
+        match cal.source_type.as_str() {
+            "google" => {
+                let cfg_str = match &cal.source_config { Some(s) => s.clone(), None => return true };
+                let cfg: serde_json::Value = match serde_json::from_str(&cfg_str) {
+                    Ok(v) => v, Err(_) => return true,
+                };
+                let email = cfg.get("email").and_then(|v| v.as_str()).unwrap_or("");
+                let safe_dir = cfg.get("safe_dir").and_then(|v| v.as_str());
+                let google_cal_id = cfg.get("google_calendar_id").and_then(|v| v.as_str()).unwrap_or("");
+                if email.is_empty() || google_cal_id.is_empty() {
+                    self.show_feedback("Google config incomplete (email/google_calendar_id)",
+                        214);
+                    return true;
+                }
+                let mut gc = crate::sources::google::GoogleCalendar::new(email, safe_dir);
+                if gc.get_access_token().is_none() {
+                    self.show_feedback("Google auth failed - run S to re-auth", 196);
+                    return true;
+                }
+                if let Some(ref existing_id) = data.external_id.clone() {
+                    // UPDATE existing remote event
+                    gc.update_event(google_cal_id, existing_id, &data);
+                } else {
+                    // CREATE new remote event; persist returned id back locally.
+                    if let Some(remote_id) = gc.create_event(google_cal_id, &data) {
+                        data.id = Some(local_id);
+                        data.external_id = Some(remote_id);
+                        let _ = self.db.save_event(&data);
+                    } else {
+                        self.show_feedback(
+                            &format!("Saved locally, Google push failed: {}",
+                                gc.last_error.as_deref().unwrap_or("unknown")),
+                            196);
+                    }
+                }
+                true
+            }
+            "outlook" => {
+                // Outlook write-back not yet wired; warn user.
+                self.show_feedback("Saved locally; Outlook write-back not implemented",
+                    214);
+                true
+            }
+            _ => false, // local calendar - no remote action
+        }
+    }
+
+    /// Mirror of push_event_remote for delete: if the calendar is remote
+    /// and we have an external id, delete it on the remote side.
+    fn delete_event_remote(&mut self, cal: &crate::database::Calendar,
+                            external_id: &str) {
+        match cal.source_type.as_str() {
+            "google" => {
+                let cfg_str = match &cal.source_config { Some(s) => s.clone(), None => return };
+                let cfg: serde_json::Value = match serde_json::from_str(&cfg_str) {
+                    Ok(v) => v, Err(_) => return,
+                };
+                let email = cfg.get("email").and_then(|v| v.as_str()).unwrap_or("");
+                let safe_dir = cfg.get("safe_dir").and_then(|v| v.as_str());
+                let google_cal_id = cfg.get("google_calendar_id").and_then(|v| v.as_str()).unwrap_or("");
+                if email.is_empty() || google_cal_id.is_empty() { return; }
+                let mut gc = crate::sources::google::GoogleCalendar::new(email, safe_dir);
+                if gc.get_access_token().is_none() { return; }
+                let _ = gc.delete_event(google_cal_id, external_id);
+            }
+            _ => {}
+        }
+    }
+
     fn create_event(&mut self) {
         let (sy, sm, sd) = self.selected_date;
         let default_time = if self.selected_slot >= 0 {
@@ -1514,12 +1590,21 @@ impl App {
             Some(serde_json::Value::Array(arr))
         };
 
+        // Description
+        self.blank_bottom(&style::bold(&style::fg(&format!(" {}", title), cal_color)));
+        let desc_str = self.bottom_ask(" Description (Enter to skip): ", "");
+        let description = if desc_str.trim().is_empty() {
+            None
+        } else {
+            Some(desc_str.trim().to_string())
+        };
+
         let data = EventData {
             id: None,
             calendar_id: cal_id,
             external_id: None,
             title: title.clone(),
-            description: None,
+            description,
             location,
             start_time: start_ts,
             end_time: end_ts,
@@ -1535,11 +1620,21 @@ impl App {
             metadata: None,
         };
 
-        let _ = self.db.save_event(&data);
+        let local_id = match self.db.save_event(&data) {
+            Ok(id) => id,
+            Err(e) => {
+                self.show_feedback(&format!("Save failed: {}", e), 196);
+                return;
+            }
+        };
+
+        // Push to remote source if applicable (Google / Outlook).
+        let pushed = self.push_event_remote(&cal, local_id, data);
+
         self.load_events_for_range();
         self.render_all();
-        let msg = format!("Event created: {}", title);
-        self.show_feedback(&msg, cal_color);
+        let suffix = if pushed { " (synced)" } else { "" };
+        self.show_feedback(&format!("Event created: {}{}", title, suffix), cal_color);
     }
 
     fn edit_event(&mut self) {
@@ -1573,10 +1668,25 @@ impl App {
             metadata: evt.metadata.clone(),
         };
 
-        let _ = self.db.save_event(&data);
+        let local_id = match self.db.save_event(&data) {
+            Ok(id) => id,
+            Err(e) => {
+                self.show_feedback(&format!("Save failed: {}", e), 196);
+                return;
+            }
+        };
+
+        // Push update to remote if the calendar is a remote source.
+        let cal_opt = self.db.get_calendars(false).ok()
+            .and_then(|cs| cs.into_iter().find(|c| c.id == evt.calendar_id));
+        let pushed = if let Some(cal) = cal_opt {
+            self.push_event_remote(&cal, local_id, data)
+        } else { false };
+
         self.load_events_for_range();
         self.render_all();
-        self.show_feedback("Event updated", 156);
+        let suffix = if pushed { " (synced)" } else { "" };
+        self.show_feedback(&format!("Event updated{}", suffix), 156);
     }
 
     fn delete_event(&mut self) {
@@ -1623,6 +1733,13 @@ impl App {
 
         let confirm = self.bottom_ask(&format!(" Delete '{}'? (y/n): ", evt.title), "");
         if confirm.trim().to_lowercase() != "y" { self.render_all(); return; }
+
+        // Push delete to remote first (before we lose the external_id).
+        let cal_opt = self.db.get_calendars(false).ok()
+            .and_then(|cs| cs.into_iter().find(|c| c.id == evt.calendar_id));
+        if let (Some(cal), Some(ref ext)) = (cal_opt, evt.external_id.as_ref()) {
+            self.delete_event_remote(&cal, ext);
+        }
 
         let _ = self.db.delete_event(evt.id);
         self.load_events_for_range();
@@ -2689,7 +2806,109 @@ fn flush_stdin() {
 // Main
 // =========================================================================
 
+/// One-shot: push a single local-only event to its remote (Google) calendar
+/// and persist the returned external_id back. Returns process exit code.
+fn push_event_oneshot(event_id: i64) -> i32 {
+    let db = match Database::new(None) {
+        Ok(d) => d,
+        Err(e) => { eprintln!("could not open tock.db: {}", e); return 1; }
+    };
+    let evt = match db.get_event(event_id) {
+        Ok(Some(e)) => e,
+        Ok(None) => { eprintln!("event {} not found", event_id); return 1; }
+        Err(e) => { eprintln!("db error: {}", e); return 1; }
+    };
+    let data = EventData {
+        id: Some(evt.id),
+        calendar_id: evt.calendar_id,
+        external_id: evt.external_id.clone(),
+        title: evt.title.clone(),
+        description: evt.description.clone(),
+        location: evt.location.clone(),
+        start_time: evt.start_time,
+        end_time: evt.end_time,
+        all_day: evt.all_day,
+        timezone: evt.timezone.clone(),
+        recurrence_rule: evt.recurrence_rule.clone(),
+        series_master_id: evt.series_master_id,
+        status: evt.status.clone(),
+        organizer: evt.organizer.clone(),
+        attendees: evt.attendees.clone(),
+        my_status: evt.my_status.clone(),
+        alarms: evt.alarms.clone(),
+        metadata: evt.metadata.clone(),
+    };
+    if data.external_id.is_some() {
+        eprintln!("event {} already has external_id={:?}; skipping",
+            evt.id, data.external_id);
+        return 0;
+    }
+    let cal = match db.get_calendars(false).ok()
+        .and_then(|cs| cs.into_iter().find(|c| c.id == data.calendar_id))
+    {
+        Some(c) => c,
+        None => { eprintln!("calendar {} not found", data.calendar_id); return 1; }
+    };
+    if cal.source_type != "google" {
+        eprintln!("calendar source_type={} (only google is supported here)", cal.source_type);
+        return 1;
+    }
+    let cfg_str = match cal.source_config.as_ref() {
+        Some(s) => s,
+        None => { eprintln!("calendar source_config missing"); return 1; }
+    };
+    let cfg: serde_json::Value = match serde_json::from_str(cfg_str) {
+        Ok(v) => v,
+        Err(e) => { eprintln!("source_config parse: {}", e); return 1; }
+    };
+    let email = cfg.get("email").and_then(|v| v.as_str()).unwrap_or("");
+    let safe_dir = cfg.get("safe_dir").and_then(|v| v.as_str());
+    let google_cal_id = cfg.get("google_calendar_id").and_then(|v| v.as_str()).unwrap_or("");
+    if email.is_empty() || google_cal_id.is_empty() {
+        eprintln!("source_config missing email or google_calendar_id");
+        return 1;
+    }
+    let mut gc = sources::google::GoogleCalendar::new(email, safe_dir);
+    if gc.get_access_token().is_none() {
+        eprintln!("Google auth failed: {:?}", gc.last_error);
+        return 1;
+    }
+    println!("pushing event {} ('{}') to calendar {}...", evt.id, evt.title, google_cal_id);
+    match gc.create_event(google_cal_id, &data) {
+        Some(remote_id) => {
+            let mut updated = data;
+            updated.id = Some(evt.id);
+            updated.external_id = Some(remote_id.clone());
+            if let Err(e) = db.save_event(&updated) {
+                eprintln!("created on Google ({}) but failed to persist external_id locally: {}",
+                    remote_id, e);
+                return 1;
+            }
+            println!("created on Google, id={} (persisted locally)", remote_id);
+            0
+        }
+        None => {
+            eprintln!("push failed: {:?}", gc.last_error);
+            1
+        }
+    }
+}
+
 fn main() {
+    // CLI: `tock --push-event <id>` pushes a single local-only event to its
+    // remote calendar (one-shot, no TUI). Used to backfill events that were
+    // created before remote write-back was wired.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = args.iter().position(|a| a == "--push-event") {
+        if let Some(id_str) = args.get(pos + 1) {
+            if let Ok(id) = id_str.parse::<i64>() {
+                std::process::exit(push_event_oneshot(id));
+            }
+        }
+        eprintln!("usage: tock --push-event <event_id>");
+        std::process::exit(2);
+    }
+
     Crust::init();
     Crust::clear_screen();
     Cursor::hide();

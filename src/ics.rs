@@ -688,7 +688,22 @@ pub fn watch_incoming(db: &Database, calendar_id: i64) -> usize {
             continue;
         }
 
-        let result = import_file(&path, db, calendar_id);
+        // Honor X-TOCK-CALENDAR-ID:<n> embedded in the ICS so external
+        // tools (kastrup's Z action, etc.) can route an event to a
+        // specific calendar instead of the default. Falls back to the
+        // configured default when the property is absent.
+        let target_cal = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| {
+                s.lines().find_map(|l| {
+                    let t = l.trim();
+                    let v = t.strip_prefix("X-TOCK-CALENDAR-ID:")?;
+                    v.trim().parse::<i64>().ok()
+                })
+            })
+            .unwrap_or(calendar_id);
+
+        let result = import_file(&path, db, target_cal);
         total_imported += result.imported;
 
         // Move to processed directory.
