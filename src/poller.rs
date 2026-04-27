@@ -86,14 +86,14 @@ fn poller_loop(
 
         notifications::check_and_notify(db, default_alarm);
 
-        // Sleep in 100ms ticks so a quit signal is honored within at
-        // most ~100ms (was 1s — visible shutdown lag).
-        let ticks = interval_secs.saturating_mul(10);
-        for _ in 0..ticks {
+        // Sleep in 1s ticks. Sub-second quit response is not worth the
+        // extra wakeups — the user explicitly preferred fewer cycles
+        // over snappier quit.
+        for _ in 0..interval_secs {
             if !running.load(Ordering::SeqCst) {
                 return;
             }
-            thread::sleep(Duration::from_millis(100));
+            thread::sleep(Duration::from_secs(1));
         }
     }
 }
