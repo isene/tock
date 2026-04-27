@@ -267,6 +267,26 @@ impl Database {
         rows.collect()
     }
 
+    /// Look up a single event by its local row id.
+    pub fn get_event(&self, id: i64) -> rusqlite::Result<Option<Event>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT e.id, e.calendar_id, e.external_id, e.title, e.description,
+                    e.location, e.start_time, e.end_time, e.all_day, e.timezone,
+                    e.recurrence_rule, e.series_master_id, e.status, e.organizer,
+                    e.attendees, e.my_status, e.alarms, e.metadata,
+                    c.name, c.color
+             FROM events e
+             JOIN calendars c ON c.id = e.calendar_id
+             WHERE e.id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![id], row_to_event)?;
+        match rows.next() {
+            Some(r) => r.map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// Convenience: events for a single calendar date.
     pub fn get_events_for_date(
         &self,
