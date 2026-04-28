@@ -140,6 +140,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "fe2o3-orbit"
+version = "0.1.0"
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -735,9 +739,10 @@ dependencies = [
 
 [[package]]
 name = "tock"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "fe2o3-crust",
+ "fe2o3-orbit",
  "libc",
  "regex",
  "rusqlite",
