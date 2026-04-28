@@ -1,7 +1,7 @@
 // Tock - Terminal calendar TUI
 // Feature and visual clone of Timely (Ruby), built on Crust.
 
-mod astronomy;
+
 mod config;
 mod database;
 mod ics;
@@ -21,7 +21,7 @@ use std::path::Path;
 // =========================================================================
 
 fn days_in_month(year: i32, month: u32) -> u32 {
-    astronomy::days_in_month(year, month)
+    orbit::days_in_month(year, month)
 }
 
 fn is_leap(year: i32) -> bool {
@@ -707,7 +707,7 @@ impl App {
         let title = style::bold(" Tock");
         let date_str = format!("  {}", format_date_long(sy, sm, sd));
 
-        let phase = astronomy::moon_phase(sy, sm, sd);
+        let phase = orbit::moon_phase(sy, sm, sd);
         let moon_color = body_color("moon");
         let moon = format!("  {} {} ({}%)",
             style::fg_rgb(phase.symbol, &moon_color), phase.phase_name,
@@ -718,7 +718,7 @@ impl App {
         let tz = self.config.get_f64("timezone_offset", 1.0);
 
         // Moon rise/set
-        let moon_rs = match astronomy::moon_times(sy, sm, sd, lat, lon, tz) {
+        let moon_rs = match orbit::moon_times(sy, sm, sd, lat, lon, tz) {
             Some((rise, set)) => {
                 let mc = body_color("moon");
                 format!("  {}\u{2191}{}  {}\u{2193}{}",
@@ -729,7 +729,7 @@ impl App {
         };
 
         // Sun rise/set
-        let sun_str = match astronomy::sun_times(sy, sm, sd, lat, lon, tz) {
+        let sun_str = match orbit::sun_times(sy, sm, sd, lat, lon, tz) {
             Some((rise, set)) => {
                 let sc = body_color("sun");
                 format!("  {}\u{2191}{}  {}\u{2193}{}",
@@ -741,7 +741,7 @@ impl App {
 
         // Visible planets (cached per date)
         if self.cached_planets_date != Some(self.selected_date) {
-            let planets = astronomy::visible_planets(sy, sm, sd, lat, lon, tz);
+            let planets = orbit::visible_planets(sy, sm, sd, lat, lon, tz);
             self.cached_planets = planets.iter().map(|p| {
                 style::fg_rgb(p.symbol, p.color)
             }).collect();
@@ -1246,7 +1246,7 @@ impl App {
             lines.push(style::bold(&format!(" {}", format_date_long(sy, sm, sd))));
 
             // Astronomical events
-            let astro = astronomy::astro_events_for_year(sy, sm, sd);
+            let astro = orbit::astro_events_for_year(sy, sm, sd);
             for a in &astro {
                 lines.push(style::fg(&format!(" {}", a), 180));
             }
@@ -2719,7 +2719,7 @@ fn truncate_str(s: &str, max: usize) -> String {
 }
 
 fn body_color(name: &str) -> String {
-    for &(n, c) in astronomy::BODY_COLORS {
+    for &(n, c) in orbit::BODY_COLORS {
         if n == name { return c.to_string(); }
     }
     "888888".to_string()
