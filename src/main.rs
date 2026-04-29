@@ -2122,6 +2122,7 @@ impl App {
             .arg(&format!("Re: {}", evt.title))
             .status();
         Crust::init();
+        Crust::set_app_identity("Tock");
         Crust::clear_screen();
         self.recreate_panes();
         self.render_all();
@@ -2910,6 +2911,7 @@ fn main() {
     }
 
     Crust::init();
+    Crust::set_app_identity("Tock");
     Crust::clear_screen();
     Cursor::hide();
 
