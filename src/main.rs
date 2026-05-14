@@ -717,33 +717,54 @@ impl App {
         let lon = self.config.get_f64("location.lon", 10.7522);
         let tz = self.config.get_f64("timezone_offset", 1.0);
 
-        // Moon rise/set
+        // Harmonised header pattern: `<body glyph> <up/down arrow>
+        // <time>` for sun AND moon, so both rise/set pairs read the
+        // same. One body glyph each, one direction-arrow set across
+        // both. The arrows are U+2191 (↑) and U+2193 (↓) which are
+        // unambiguously text in every terminal font we care about.
+        // VS-15 (U+FE0E) on the body glyphs keeps emoji-presentation
+        // renderers from blowing them up to 2-cell colour icons.
         let moon_rs = match orbit::moon_times(sy, sm, sd, lat, lon, tz) {
             Some((rise, set)) => {
                 let mc = body_color("moon");
+                // ☾ U+263E LAST QUARTER MOON — used as the generic
+                // moon body glyph here, neutral on waxing/waning so
+                // the symbol describes the body, not its phase.
                 format!("  {}\u{2191}{}  {}\u{2193}{}",
-                    style::fg_rgb("\u{263D}", &mc), rise,
-                    style::fg_rgb("\u{263D}", &mc), set)
+                    style::fg_rgb("\u{263E}\u{FE0E}", &mc), rise,
+                    style::fg_rgb("\u{263E}\u{FE0E}", &mc), set)
             }
             None => String::new(),
         };
-
-        // Sun rise/set
         let sun_str = match orbit::sun_times(sy, sm, sd, lat, lon, tz) {
             Some((rise, set)) => {
                 let sc = body_color("sun");
+                // ☀ U+2600 BLACK SUN WITH RAYS — same sun for both,
+                // arrow tells which is which. Avoids the earlier
+                // `☼ + ☀` pair which rendered as `✷ + ☀` in some
+                // fonts and didn't read as "matched set".
                 format!("  {}\u{2191}{}  {}\u{2193}{}",
-                    style::fg_rgb("\u{2600}", &sc), rise,
-                    style::fg_rgb("\u{2600}", &sc), set)
+                    style::fg_rgb("\u{2600}\u{FE0E}", &sc), rise,
+                    style::fg_rgb("\u{2600}\u{FE0E}", &sc), set)
             }
             None => String::new(),
         };
 
-        // Visible planets (cached per date)
+        // Visible planets (cached per date). We override orbit's
+        // astrological glyphs with two-letter Latin abbreviations
+        // (Me / Ve / Ma / Ju / Sa) so the row reads uniformly in
+        // every terminal. Venus and Mars are on Unicode's default-
+        // emoji list and many font stacks ignore VS-15 — those two
+        // would blow up to 2-cell colour icons next to small-text
+        // Mercury / Jupiter / Saturn and the row would never sit
+        // flush. Colour from `p.color` still distinguishes them at
+        // a glance. Nova / astro keep the orbit glyphs since they
+        // render in different contexts.
         if self.cached_planets_date != Some(self.selected_date) {
             let planets = orbit::visible_planets(sy, sm, sd, lat, lon, tz);
             self.cached_planets = planets.iter().map(|p| {
-                style::fg_rgb(p.symbol, p.color)
+                let abbrev = planet_abbrev(p.name);
+                style::fg_rgb(abbrev, p.color)
             }).collect();
             self.cached_planets_date = Some(self.selected_date);
         }
@@ -1120,18 +1141,68 @@ impl App {
                 let cell = if let Some(evt) = evt_opt {
                     let is_at_slot = is_sel && is_slot_selected;
                     let marker = if is_at_slot { ">" } else { " " };
-                    let title = if evt.title.is_empty() { "(No title)" } else { &evt.title };
-                    let rsvp = rsvp_marker(evt.my_status.as_deref());
-                    let labeled = if rsvp.is_empty() { title.to_string() } else { format!("{} {}", rsvp, title) };
-                    let mut entry = format!("{}{}", marker, labeled);
-                    if entry.len() > day_col {
-                        entry = format!("{}.", truncate_str(&entry, day_col.saturating_sub(1)));
-                    }
                     let color = evt.calendar_color as u8;
-                    if is_at_slot {
-                        style::bg(&style::bold(&style::fg(&entry, color)), cell_bg)
+                    // The title only renders in ONE row per event:
+                    // either the slot where the event starts (so a
+                    // 09:00 event lands on row 09:00), or — when the
+                    // event began before the visible window — at the
+                    // top of the visible scroll so the user always
+                    // sees the name once. Continuation slots show a
+                    // thin left-edge bar in the calendar's colour so
+                    // the span is still obvious without the title
+                    // being printed 13 times.
+                    let starts_here = evt.start_time >= day_ts_start && evt.start_time < day_ts_end;
+                    let is_first_visible = slot_idx == self.slot_offset
+                        && evt.start_time < day_ts_start;
+                    let show_title = starts_here || is_first_visible;
+                    let ends_here = evt.end_time > day_ts_start && evt.end_time <= day_ts_end;
+
+                    if show_title {
+                        let title = if evt.title.is_empty() { "(No title)" } else { &evt.title };
+                        let rsvp = rsvp_marker(evt.my_status.as_deref());
+                        let labeled = if rsvp.is_empty() {
+                            title.to_string()
+                        } else {
+                            format!("{} {}", rsvp, title)
+                        };
+                        let mut entry = format!("{}{}", marker, labeled);
+                        if entry.len() > day_col {
+                            entry = format!("{}.", truncate_str(&entry, day_col.saturating_sub(1)));
+                        }
+                        if is_at_slot {
+                            style::bg(&style::bold(&style::fg(&entry, color)), cell_bg)
+                        } else {
+                            style::bg(&style::fg(&entry, color), cell_bg)
+                        }
                     } else {
-                        style::bg(&style::fg(&entry, color), cell_bg)
+                        // Continuation row. `▕` (U+2595 RIGHT ONE
+                        // EIGHTH BLOCK) draws a single thin bar on
+                        // the left edge in the event's colour; the
+                        // rest of the cell stays on the slot bg so
+                        // it reads as quiet continuation rather than
+                        // a heavy block. The last slot of a multi-
+                        // slot event additionally prints the end
+                        // time (e.g. "▕ -15:30") so the GM knows
+                        // exactly where it stops without scrolling.
+                        let bar = if is_at_slot {
+                            style::bold(&style::fg("\u{2595}", color))
+                        } else {
+                            style::fg("\u{2595}", color)
+                        };
+                        let tail = if ends_here {
+                            let end_local = evt.end_time + tz;
+                            let hh = ((end_local.rem_euclid(86400)) / 3600) as i32;
+                            let mm = ((end_local.rem_euclid(3600)) / 60) as i32;
+                            format!(" -{:02}:{:02}", hh, mm)
+                        } else {
+                            String::new()
+                        };
+                        let tail_styled = if tail.is_empty() {
+                            String::new()
+                        } else {
+                            style::fg(&tail, color)
+                        };
+                        style::bg(&format!("{}{}", bar, tail_styled), cell_bg)
                     }
                 } else {
                     style::bg(" ", cell_bg)
@@ -2726,6 +2797,25 @@ fn body_color(name: &str) -> String {
     "888888".to_string()
 }
 
+/// Two-letter Latin abbreviation for the planet name returned by
+/// `orbit::visible_planets`. Used by the tock header so the planet
+/// row renders uniformly across terminals — the astrological glyphs
+/// from orbit don't all honour VS-15 on every font stack (Venus and
+/// Mars in particular tend to upgrade to emoji), and a mixed row of
+/// some-text some-emoji looks worse than this clean letter set.
+fn planet_abbrev(name: &str) -> &'static str {
+    match name {
+        "Mercury" => "Me",
+        "Venus"   => "Ve",
+        "Mars"    => "Ma",
+        "Jupiter" => "Ju",
+        "Saturn"  => "Sa",
+        "Uranus"  => "Ur",
+        "Neptune" => "Ne",
+        _ => "?",
+    }
+}
+
 /// Subtle single-glyph RSVP marker: a dot for "accepted" / "organizer",
 /// "?" for tentative, "×" for declined. Empty for unresponded or missing.
 fn rsvp_marker(my_status: Option<&str>) -> &'static str {
@@ -2938,6 +3028,9 @@ fn main() {
     flush_stdin();
 
     let mut weather_date = today();
+    // Notification alarms fire on minute precision (±1min window). No need
+    // to recheck on every idle wake.
+    let mut last_notify_minute: i64 = -1;
 
     while app.running {
         let key = Input::getchr(Some(2));
@@ -2950,9 +3043,13 @@ fn main() {
                 app.render_all();
             }
 
-            // Check notifications
-            let default_alarm = app.config.get_i64("notifications.default_alarm", 15);
-            notifications::check_and_notify(&app.db, default_alarm);
+            // Check notifications only when the wall-clock minute changes.
+            let cur_minute = crate::database::now_secs() / 60;
+            if cur_minute != last_notify_minute {
+                last_notify_minute = cur_minute;
+                let default_alarm = app.config.get_i64("notifications.default_alarm", 15);
+                notifications::check_and_notify(&app.db, default_alarm);
+            }
 
             // Refresh weather on new day
             let t = today();

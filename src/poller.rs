@@ -2,8 +2,7 @@
 // Fetches events from Google and Outlook calendars, upserts into the
 // local database, and triggers UI refresh when new events arrive.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -24,7 +23,10 @@ pub enum PollerEvent {
 // ---------------------------------------------------------------------------
 
 pub struct Poller {
-    running: Arc<AtomicBool>,
+    // (stopped flag, wakeup condvar). Notifying the condvar wakes the
+    // sleeper instantly so stop() doesn't have to wait for the next
+    // 1s sleep tick.
+    stopped: Arc<(Mutex<bool>, Condvar)>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -35,8 +37,8 @@ impl Poller {
         config: &Config,
         tx: mpsc::Sender<PollerEvent>,
     ) -> Self {
-        let running = Arc::new(AtomicBool::new(true));
-        let flag = running.clone();
+        let stopped = Arc::new((Mutex::new(false), Condvar::new()));
+        let flag = stopped.clone();
 
         let sync_interval = config.get_i64("google.sync_interval", 300) as u64;
         let default_alarm = config.get_i64("notifications.default_alarm", 15);
@@ -46,14 +48,16 @@ impl Poller {
         });
 
         Poller {
-            running,
+            stopped,
             thread: Some(handle),
         }
     }
 
     /// Signal the background thread to stop and wait for it to finish.
     pub fn stop(&mut self) {
-        self.running.store(false, Ordering::SeqCst);
+        let (lock, cvar) = &*self.stopped;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
         if let Some(handle) = self.thread.take() {
             let _ = handle.join();
         }
@@ -74,10 +78,10 @@ fn poller_loop(
     db: &Database,
     interval_secs: u64,
     default_alarm: i64,
-    running: &AtomicBool,
+    stopped: &(Mutex<bool>, Condvar),
     tx: &mpsc::Sender<PollerEvent>,
 ) {
-    while running.load(Ordering::SeqCst) {
+    loop {
         let any_new = run_sync_cycle(db);
 
         if any_new {
@@ -86,14 +90,17 @@ fn poller_loop(
 
         notifications::check_and_notify(db, default_alarm);
 
-        // Sleep in 1s ticks. Sub-second quit response is not worth the
-        // extra wakeups — the user explicitly preferred fewer cycles
-        // over snappier quit.
-        for _ in 0..interval_secs {
-            if !running.load(Ordering::SeqCst) {
-                return;
-            }
-            thread::sleep(Duration::from_secs(1));
+        // Park on the condvar for the full sync interval. stop() flips the
+        // flag and notifies, so shutdown is instant — no per-second ticks.
+        let (lock, cvar) = stopped;
+        let guard = lock.lock().unwrap();
+        let (guard, _) = cvar.wait_timeout_while(
+            guard,
+            Duration::from_secs(interval_secs),
+            |stop| !*stop,
+        ).unwrap();
+        if *guard {
+            return;
         }
     }
 }
