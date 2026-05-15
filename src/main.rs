@@ -2175,12 +2175,23 @@ impl App {
         self.render_all();
     }
 
-    /// `J` (Join) — open the selected event's meeting URL in the
-    /// vendor-appropriate client. Teams URLs go to `teams-for-linux`;
-    /// everything else falls through to `xdg-open` so the user's
-    /// browser / scheme handler takes over (Zoom, Google Meet, …).
-    /// Detached spawn — tock stays in the foreground, no terminal
-    /// hand-off needed for the GUI app.
+    /// `J` (Join) — open the selected event's meeting URL.
+    ///
+    /// Launcher selection is config-driven via `meeting_handlers:` in
+    /// `~/.tock/config.yml`. Each entry maps a host suffix to a
+    /// command, e.g.
+    ///
+    /// ```yaml
+    /// meeting_handlers:
+    ///   teams.microsoft.com: teams-for-linux
+    ///   zoom.us: ""             # empty = force xdg-open
+    /// ```
+    ///
+    /// Host matching is suffix-based (so `us02web.zoom.us` matches a
+    /// `zoom.us` entry). Empty values, missing entries, and missing
+    /// binaries all fall back to `xdg-open` — which hands the URL to
+    /// the user's default browser. Detached spawn so tock stays in
+    /// the foreground.
     fn join_meeting(&mut self) {
         let evt = match self.event_at_selected_slot() {
             Some(e) => e,
@@ -2196,24 +2207,58 @@ impl App {
                 "No meeting URL found in description or location", 245);
             return;
         };
-        // Pick the launcher. Teams URLs go through the native
-        // electron wrapper (teams-for-linux); xdg-open is the
-        // catch-all for everyone else (zoom, meet, webex, …) so the
-        // user's MIME / scheme handlers decide.
-        let launcher = if url.contains("teams.microsoft.com") {
-            "teams-for-linux"
-        } else {
-            "xdg-open"
+
+        // Walk meeting_handlers from longest suffix to shortest so
+        // `teams.microsoft.com` wins over a hypothetical bare
+        // `microsoft.com` entry.
+        let host = url_host(&url).unwrap_or_default();
+        let handlers = self.config.get(
+            "meeting_handlers",
+            serde_yaml::Value::Mapping(Default::default()),
+        );
+        let mut configured: Option<String> = None;
+        if let serde_yaml::Value::Mapping(m) = handlers {
+            let mut entries: Vec<(String, String)> = m.into_iter()
+                .filter_map(|(k, v)| {
+                    let key = k.as_str()?.to_string();
+                    let val = v.as_str().unwrap_or("").to_string();
+                    Some((key, val))
+                })
+                .collect();
+            entries.sort_by_key(|(k, _)| std::cmp::Reverse(k.len()));
+            for (suffix, cmd) in entries {
+                if host == suffix || host.ends_with(&format!(".{}", suffix)) {
+                    if !cmd.trim().is_empty() {
+                        configured = Some(cmd);
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Resolve the launcher. If the config says use `foo` but `foo`
+        // isn't on PATH, drop down to xdg-open with a status note so
+        // the user knows what happened.
+        let (launcher, fallback) = match configured {
+            Some(cmd) if which_on_path(&cmd) => (cmd, false),
+            Some(cmd) => {
+                self.show_feedback(
+                    &format!("{} not in PATH, opening in browser…", cmd), 245);
+                ("xdg-open".to_string(), true)
+            }
+            None => ("xdg-open".to_string(), false),
         };
-        let spawned = std::process::Command::new(launcher)
+
+        let spawned = std::process::Command::new(&launcher)
             .arg(&url)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn();
         match spawned {
-            Ok(_) => self.show_feedback(
+            Ok(_) if !fallback => self.show_feedback(
                 &format!("Joining via {}…", launcher), 156),
+            Ok(_) => {}  // already showed the fallback note above
             Err(e) => self.show_feedback(
                 &format!("Couldn't launch {}: {}", launcher, e), 196),
         }
@@ -2743,7 +2788,7 @@ impl App {
         lines.push(format!("  {}    {}    {}       {}", k("x/DEL"), d("Delete event"), k("a"), d("Accept invite")));
         lines.push(format!("  {}        {}", k("v"), d("View event details (scrollable popup)")));
         lines.push(format!("  {}        {}", k("r"), d("Reply via Heathrow")));
-        lines.push(format!("  {}        {}", k("J"), d("Join meeting (Teams → teams-for-linux, else xdg-open)")));
+        lines.push(format!("  {}        {}", k("J"), d("Join meeting (per-host handler from config, else browser)")));
         lines.push(sep.clone());
         lines.push(format!("  {}  {}   {}  {}   {}  {}", k("i"), d("Import ICS"), k("G"), d("Google setup"), k("O"), d("Outlook setup")));
         lines.push(format!("  {}  {}     {}  {}      {}  {}", k("S"), d("Sync now"), k("C"), d("Calendars"), k("P"), d("Preferences")));
@@ -2967,6 +3012,33 @@ fn extract_meeting_url(haystack: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Pull the host out of a URL string. Returns the part between
+/// `://` and the first `/` (or end-of-string). Lowercased so
+/// host-suffix matching works regardless of how the URL was cased.
+/// `msteams:` and other schemes without `://` return None.
+fn url_host(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://")?.1;
+    let host = after_scheme.split('/').next()?;
+    // Strip optional `user:pass@` and trailing `:port`.
+    let host = host.rsplit_once('@').map(|(_, h)| h).unwrap_or(host);
+    let host = host.split_once(':').map(|(h, _)| h).unwrap_or(host);
+    Some(host.to_ascii_lowercase())
+}
+
+/// Cheap, dependency-free `which`: probe each `:`-separated PATH dir
+/// for an executable file named `cmd`. We don't try to follow
+/// symlinks or check exec bits exhaustively — `is_file()` plus the
+/// path's existence is enough for the "is teams-for-linux installed"
+/// gate the join flow needs.
+fn which_on_path(cmd: &str) -> bool {
+    let path = match std::env::var_os("PATH") { Some(p) => p, None => return false };
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(cmd);
+        if candidate.is_file() { return true; }
+    }
+    false
 }
 
 /// Flush any pending bytes on stdin
@@ -3205,5 +3277,19 @@ mod tests {
     fn returns_none_when_no_url() {
         assert!(extract_meeting_url("Lunch at the canteen, no link").is_none());
         assert!(extract_meeting_url("").is_none());
+    }
+
+    #[test]
+    fn url_host_extracts_lowercased_host() {
+        assert_eq!(url_host("https://teams.microsoft.com/meet/123?p=x"),
+                   Some("teams.microsoft.com".into()));
+        assert_eq!(url_host("HTTPS://Teams.Microsoft.Com/x"),
+                   Some("teams.microsoft.com".into()));
+        assert_eq!(url_host("https://us02web.zoom.us/j/123"),
+                   Some("us02web.zoom.us".into()));
+        assert_eq!(url_host("https://user:pass@host.example.com:8080/p"),
+                   Some("host.example.com".into()));
+        assert_eq!(url_host("msteams:foo"), None);
+        assert_eq!(url_host("not a url"), None);
     }
 }
