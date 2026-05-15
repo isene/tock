@@ -1411,6 +1411,7 @@ impl App {
             "A" => self.decline_invite(),
             "T" => self.tentative_invite(),
             "F" => self.show_free_busy(),
+            "J" => self.join_meeting(),
             "r" => self.reply_via_kastrup(),
             "i" => self.import_ics_file(),
             "G" => self.setup_google_calendar(),
@@ -2174,6 +2175,50 @@ impl App {
         self.render_all();
     }
 
+    /// `J` (Join) — open the selected event's meeting URL in the
+    /// vendor-appropriate client. Teams URLs go to `teams-for-linux`;
+    /// everything else falls through to `xdg-open` so the user's
+    /// browser / scheme handler takes over (Zoom, Google Meet, …).
+    /// Detached spawn — tock stays in the foreground, no terminal
+    /// hand-off needed for the GUI app.
+    fn join_meeting(&mut self) {
+        let evt = match self.event_at_selected_slot() {
+            Some(e) => e,
+            None => { self.show_feedback("No event at this time slot", 245); return; }
+        };
+        let haystack = {
+            let desc = evt.description.as_deref().unwrap_or("");
+            let loc  = evt.location.as_deref().unwrap_or("");
+            format!("{}\n{}", desc, loc)
+        };
+        let Some(url) = extract_meeting_url(&haystack) else {
+            self.show_feedback(
+                "No meeting URL found in description or location", 245);
+            return;
+        };
+        // Pick the launcher. Teams URLs go through the native
+        // electron wrapper (teams-for-linux); xdg-open is the
+        // catch-all for everyone else (zoom, meet, webex, …) so the
+        // user's MIME / scheme handlers decide.
+        let launcher = if url.contains("teams.microsoft.com") {
+            "teams-for-linux"
+        } else {
+            "xdg-open"
+        };
+        let spawned = std::process::Command::new(launcher)
+            .arg(&url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        match spawned {
+            Ok(_) => self.show_feedback(
+                &format!("Joining via {}…", launcher), 156),
+            Err(e) => self.show_feedback(
+                &format!("Couldn't launch {}: {}", launcher, e), 196),
+        }
+    }
+
     fn reply_via_kastrup(&mut self) {
         let evt = match self.event_at_selected_slot() {
             Some(e) => e,
@@ -2698,6 +2743,7 @@ impl App {
         lines.push(format!("  {}    {}    {}       {}", k("x/DEL"), d("Delete event"), k("a"), d("Accept invite")));
         lines.push(format!("  {}        {}", k("v"), d("View event details (scrollable popup)")));
         lines.push(format!("  {}        {}", k("r"), d("Reply via Heathrow")));
+        lines.push(format!("  {}        {}", k("J"), d("Join meeting (Teams → teams-for-linux, else xdg-open)")));
         lines.push(sep.clone());
         lines.push(format!("  {}  {}   {}  {}   {}  {}", k("i"), d("Import ICS"), k("G"), d("Google setup"), k("O"), d("Outlook setup")));
         lines.push(format!("  {}  {}     {}  {}      {}  {}", k("S"), d("Sync now"), k("C"), d("Calendars"), k("P"), d("Preferences")));
@@ -2879,6 +2925,48 @@ fn shellexpand(path: &str) -> String {
     } else {
         path.to_string()
     }
+}
+
+/// Pick the most useful meeting URL out of an event's description /
+/// location blob. Priority order:
+///   1. Modern Teams meet links     `https://teams.microsoft.com/meet/<id>?p=…`
+///   2. Classic Teams meetup-join   `https://teams.microsoft.com/l/meetup-join/19%3a…`
+///   3. Any Teams URL (msteams: scheme included)
+///   4. Zoom join links             `https://*.zoom.us/j/<id>` (with optional ?pwd=)
+///   5. Google Meet                 `https://meet.google.com/<id>`
+///   6. Any https?:// URL — last-resort fallback
+///
+/// Returns the first hit; the calling site picks the launcher
+/// (teams-for-linux for Teams URLs, xdg-open for the rest).
+fn extract_meeting_url(haystack: &str) -> Option<String> {
+    use regex::Regex;
+    // Patterns anchor URLs against terminating characters (whitespace,
+    // `>`, `"`, `'`, `<`, `]`) so we don't capture trailing markup
+    // from html-formatted descriptions. The `tail` placeholder gets
+    // substituted into each pattern.
+    let tail = r#"[^\s<>"'\]]+"#;
+    let patterns: [String; 7] = [
+        format!(r"https://teams\.microsoft\.com/meet/{}", tail),
+        format!(r"https://teams\.microsoft\.com/l/meetup-join/{}", tail),
+        r#"msteams:[^\s<>"']+"#.to_string(),
+        format!(r"https://teams\.microsoft\.com/{}", tail),
+        format!(r"https://[a-zA-Z0-9.-]+\.zoom\.us/j/{}", tail),
+        format!(r"https://meet\.google\.com/[a-z0-9-]+(?:\?{})?", tail),
+        format!(r"https?://{}", tail),
+    ];
+    for p in &patterns {
+        let re = Regex::new(p).ok()?;
+        if let Some(m) = re.find(haystack) {
+            // Strip a trailing `)` / `.` / `,` that often closes an
+            // inline link in Markdown or Outlook-flavoured plain text.
+            let mut s = m.as_str().to_string();
+            while s.ends_with(')') || s.ends_with('.') || s.ends_with(',') {
+                s.pop();
+            }
+            return Some(s);
+        }
+    }
+    None
 }
 
 /// Flush any pending bytes on stdin
@@ -3069,4 +3157,53 @@ fn main() {
     drop(poller);
     Cursor::show();
     Crust::cleanup();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_modern_teams_meet() {
+        let body = "Join: https://teams.microsoft.com/meet/31274339366591?p=10ubU0wL4gdnhyeK9w\nMeeting ID: 312";
+        let url = extract_meeting_url(body).unwrap();
+        assert!(url.starts_with("https://teams.microsoft.com/meet/31274339366591"));
+        assert!(url.contains("?p=10ubU0wL4gdnhyeK9w"));
+    }
+
+    #[test]
+    fn extract_classic_meetup_join() {
+        let body = "System reference<https://teams.microsoft.com/l/meetup-join/19%3ameeting_OGNh@thread.v2/0?context=%7b%22Tid%22%3a%22012%22%7d>";
+        let url = extract_meeting_url(body).unwrap();
+        assert!(url.contains("/l/meetup-join/19%3ameeting_OGNh"));
+        // Must not include the trailing > from the html-style link.
+        assert!(!url.ends_with('>'));
+    }
+
+    #[test]
+    fn modern_meet_link_beats_classic_when_both_present() {
+        // Real outlook descriptions ship the modern `meet/` URL up
+        // top and the classic `l/meetup-join` further down. The
+        // first hit wins so we get the human-readable one.
+        let body = "
+            Join: https://teams.microsoft.com/meet/31274339366591?p=10ubU0w
+            ...
+            System reference: https://teams.microsoft.com/l/meetup-join/19%3a@thread.v2/0
+        ";
+        let url = extract_meeting_url(body).unwrap();
+        assert!(url.contains("/meet/31274339366591"));
+    }
+
+    #[test]
+    fn extract_zoom() {
+        let body = "Please join: https://us02web.zoom.us/j/12345678?pwd=abc def";
+        let url = extract_meeting_url(body).unwrap();
+        assert!(url.starts_with("https://us02web.zoom.us/j/12345678"));
+    }
+
+    #[test]
+    fn returns_none_when_no_url() {
+        assert!(extract_meeting_url("Lunch at the canteen, no link").is_none());
+        assert!(extract_meeting_url("").is_none());
+    }
 }
