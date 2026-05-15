@@ -76,6 +76,12 @@ colors:
   info_bg: 235
   status_bg: 235
 default_calendar: 1
+# Meeting launchers for the `J` (Join) key. Keys are host suffixes
+# matched against the meeting URL (so `us02web.zoom.us` resolves
+# under a `zoom.us` entry). Empty values force the xdg-open path.
+# Any host not listed falls back to xdg-open (i.e. your browser).
+meeting_handlers:
+  teams.microsoft.com: teams-for-linux
 "#;
     serde_yaml::from_str(yaml_str).expect("default config must parse")
 }
