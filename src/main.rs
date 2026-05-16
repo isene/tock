@@ -1473,6 +1473,27 @@ impl App {
             }
         }
 
+        // yyyymmdd (8-digit, no separator)
+        if input.len() == 8 && input.chars().all(|c| c.is_ascii_digit()) {
+            let y: i32 = input[0..4].parse().ok()?;
+            let m: u32 = input[4..6].parse().ok()?;
+            let d: u32 = input[6..8].parse().ok()?;
+            if m >= 1 && m <= 12 && d >= 1 && d <= days_in_month(y, m) {
+                return Some((y, m, d));
+            }
+        }
+
+        // mmdd (4-digit, current selected year). Falls through to year-only
+        // when month/day are out of range (e.g. 2026 → year, not month=20).
+        if input.len() == 4 && input.chars().all(|c| c.is_ascii_digit()) {
+            let m: u32 = input[0..2].parse().ok()?;
+            let d: u32 = input[2..4].parse().ok()?;
+            let (sy, _, _) = self.selected_date;
+            if m >= 1 && m <= 12 && d >= 1 && d <= days_in_month(sy, m) {
+                return Some((sy, m, d));
+            }
+        }
+
         // Year only
         if input.len() == 4 {
             if let Ok(y) = input.parse::<i32>() {
