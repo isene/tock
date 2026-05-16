@@ -1953,9 +1953,15 @@ impl App {
                 for dline in desc.split('\n') {
                     let mut remaining = dline.to_string();
                     let max_w = pw as usize - 6;
-                    while remaining.len() > max_w {
-                        lines.push(style::fg(&format!("  {}", &remaining[..max_w]), 248));
-                        remaining = remaining[max_w..].to_string();
+                    // Fix: use char-based slicing for multi-byte (CJK) safety
+                    while remaining.chars().count() > max_w {
+                        let split_at = remaining
+                            .char_indices()
+                            .nth(max_w)
+                            .map(|(i, _)| i)
+                            .unwrap_or(remaining.len());
+                        lines.push(style::fg(&format!("  {}", &remaining[..split_at]), 248));
+                        remaining = remaining[split_at..].to_string();
                     }
                     lines.push(style::fg(&format!("  {}", remaining), 248));
                 }
