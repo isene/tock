@@ -188,7 +188,8 @@ fn sync_google_calendar(
         None => return false,
     };
 
-    let mut any_new = false;
+    let mut any_new = reconcile_deletions(db, cal.id, &events, range_start, range_end);
+
     for mut ev in events {
         ev.calendar_id = cal.id;
         match db.upsert_synced_event(cal.id, &ev) {
@@ -200,6 +201,37 @@ fn sync_google_calendar(
 
     let _ = db.update_calendar_sync(cal.id, now_secs(), None);
     any_new
+}
+
+/// Delete events still in tock.db but no longer present in the fresh fetch
+/// from the remote source. Google's REST API soft-deletes events to status
+/// `cancelled` and excludes them from default `events.list` results — so
+/// without this reconcile step, deleted events linger in tock forever.
+/// Returns true if any orphans were removed (signals UI refresh).
+fn reconcile_deletions(
+    db: &Database,
+    cal_id: i64,
+    fresh: &[EventData],
+    range_start: i64,
+    range_end: i64,
+) -> bool {
+    let fresh_ids: std::collections::HashSet<String> = fresh
+        .iter()
+        .filter_map(|e| e.external_id.clone())
+        .collect();
+    let existing = match db.external_ids_in_range(cal_id, range_start, range_end) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let mut removed = false;
+    for id in existing {
+        if !fresh_ids.contains(&id) {
+            if db.delete_event_by_external_id(cal_id, &id).is_ok() {
+                removed = true;
+            }
+        }
+    }
+    removed
 }
 
 fn ts_to_rfc3339(ts: i64) -> String {
@@ -255,7 +287,8 @@ fn sync_outlook_calendar(
         None => return false,
     };
 
-    let mut any_new = false;
+    let mut any_new = reconcile_deletions(db, cal.id, &events, range_start, range_end);
+
     for mut ev in events {
         ev.calendar_id = cal.id;
         match db.upsert_synced_event(cal.id, &ev) {

@@ -622,6 +622,36 @@ impl Database {
         Ok(())
     }
 
+    /// External IDs of synced events in `calendar_id` whose `start_time`
+    /// falls inside `[range_start, range_end]`. Used by remote sync to
+    /// detect orphans — events that are still in tock.db but no longer
+    /// returned by the upstream source (Google / Outlook) → upstream
+    /// deletion. Without this, deleted events linger forever.
+    pub fn external_ids_in_range(
+        &self,
+        calendar_id: i64,
+        range_start: i64,
+        range_end: i64,
+    ) -> rusqlite::Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT external_id FROM events
+             WHERE calendar_id = ?1
+               AND external_id IS NOT NULL
+               AND start_time BETWEEN ?2 AND ?3",
+        )?;
+        let rows = stmt.query_map(params![calendar_id, range_start, range_end], |r| {
+            r.get::<_, String>(0)
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            if let Ok(id) = r {
+                out.push(id);
+            }
+        }
+        Ok(out)
+    }
+
     // -----------------------------------------------------------------------
     // Sync helper
     // -----------------------------------------------------------------------
