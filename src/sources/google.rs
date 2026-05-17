@@ -290,6 +290,69 @@ impl GoogleCalendar {
         self.api_delete(&path)
     }
 
+    /// Update the user's own `responseStatus` on an event and notify
+    /// the organizer (`sendUpdates=all`). Returns true on a
+    /// successful PATCH. The attendee is matched by case-insensitive
+    /// email or, failing that, by the entry flagged `"self": true`
+    /// (Google sets this for whichever account the API is auth'd as).
+    pub fn respond_to_event(
+        &mut self,
+        calendar_id: &str,
+        event_id: &str,
+        my_email: &str,
+        response: &str,
+    ) -> bool {
+        let google_status = match response {
+            "accept" | "accepted" => "accepted",
+            "decline" | "declined" => "declined",
+            "tentative" | "tentativelyAccepted" => "tentative",
+            _ => {
+                self.last_error = Some(format!("Unknown response: {}", response));
+                return false;
+            }
+        };
+        // Google PATCH replaces the attendees array wholesale, so
+        // we must round-trip: GET → mutate self entry → PATCH back.
+        let get_path = format!(
+            "/calendar/v3/calendars/{}/events/{}",
+            url_encode(calendar_id),
+            url_encode(event_id),
+        );
+        let mut ev = match self.api_get(&get_path) {
+            Some(v) => v,
+            None    => return false,
+        };
+        let attendees = match ev.get_mut("attendees").and_then(|v| v.as_array_mut()) {
+            Some(a) => a,
+            None => {
+                self.last_error = Some("Event has no attendees".into());
+                return false;
+            }
+        };
+        let my_lc = my_email.to_ascii_lowercase();
+        let mut matched = false;
+        for a in attendees.iter_mut() {
+            let email = a.get("email").and_then(Value::as_str).unwrap_or("").to_ascii_lowercase();
+            let is_self = a.get("self").and_then(Value::as_bool).unwrap_or(false);
+            if (!my_lc.is_empty() && email == my_lc) || is_self {
+                a["responseStatus"] = Value::String(google_status.to_string());
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            self.last_error = Some(format!("Not an attendee: {}", my_email));
+            return false;
+        }
+        let body = serde_json::json!({ "attendees": attendees });
+        let patch_path = format!(
+            "/calendar/v3/calendars/{}/events/{}?sendUpdates=all",
+            url_encode(calendar_id),
+            url_encode(event_id),
+        );
+        self.api_patch(&patch_path, &body).is_some()
+    }
+
     // -----------------------------------------------------------------------
     // HTTP helpers
     // -----------------------------------------------------------------------
@@ -349,6 +412,34 @@ impl GoogleCalendar {
             },
             Err(e) => {
                 self.last_error = Some(format!("POST {} failed: {}", url, e));
+                None
+            }
+        }
+    }
+
+    fn api_patch(&mut self, path: &str, body: &Value) -> Option<Value> {
+        let token = self.get_access_token()?;
+        let url = format!("https://www.googleapis.com{}", path);
+
+        let resp = ureq::request("PATCH", &url)
+            .set("Authorization", &format!("Bearer {}", token))
+            .set("Content-Type", "application/json")
+            .timeout(std::time::Duration::from_secs(60))
+            .send_json(body.clone());
+
+        match resp {
+            Ok(r) => match r.into_json::<Value>() {
+                Ok(v) => {
+                    self.last_error = None;
+                    Some(v)
+                }
+                Err(e) => {
+                    self.last_error = Some(format!("JSON parse error: {}", e));
+                    None
+                }
+            },
+            Err(e) => {
+                self.last_error = Some(format!("PATCH {} failed: {}", url, e));
                 None
             }
         }

@@ -2040,6 +2040,32 @@ impl App {
                         graph_ok = Some(false);
                     }
                 }
+            } else if stype == "google" {
+                // Google Calendar RSVP: PATCH the event with the user's
+                // updated responseStatus and `sendUpdates=all` so the
+                // organizer's mail client sees the reply. The user's
+                // identity for this calendar lives in source_config.email;
+                // the actual calendar id (usually identical) is in
+                // google_calendar_id.
+                if let Ok(config) = serde_json::from_str::<serde_json::Value>(cfg_str) {
+                    let email = config.get("email").and_then(|v| v.as_str()).unwrap_or("");
+                    let cal_id = config.get("google_calendar_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(email);
+                    let safe_dir = config.get("safe_dir").and_then(|v| v.as_str());
+                    if !email.is_empty() && !cal_id.is_empty() {
+                        let mut gc = crate::sources::google::GoogleCalendar::new(email, safe_dir);
+                        if gc.get_access_token().is_some() {
+                            if let Some(ref ext) = evt.external_id {
+                                graph_ok = Some(gc.respond_to_event(cal_id, ext, email, response));
+                            } else {
+                                graph_ok = Some(false);
+                            }
+                        } else {
+                            graph_ok = Some(false);
+                        }
+                    }
+                }
             }
         }
 
@@ -2069,7 +2095,7 @@ impl App {
 
         let msg = match graph_ok {
             Some(true)  => format!("{} (organizer notified)", humanize_status(my_status_value)),
-            Some(false) => format!("{} locally — Graph call failed", humanize_status(my_status_value)),
+            Some(false) => format!("{} locally — RSVP propagation failed", humanize_status(my_status_value)),
             None        => format!("{} locally — no propagation for this calendar", humanize_status(my_status_value)),
         };
         let color = if matches!(graph_ok, Some(false)) { 196 } else { 156 };
