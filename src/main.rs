@@ -2275,12 +2275,25 @@ impl App {
             None => ("xdg-open".to_string(), false),
         };
 
-        let spawned = std::process::Command::new(&launcher)
-            .arg(&url)
+        // GUI launchers like teams-for-linux (Electron) trust
+        // XDG_SESSION_TYPE when picking a display backend. Some
+        // display managers (gdm/sddm on hybrid systems) export
+        // `wayland` even on X11 sessions where WAYLAND_DISPLAY is
+        // unset; the launcher then tries Wayland, fails to connect,
+        // and exits silently — leaving a zombie child behind.
+        // Force the child's session type back to x11 in that case.
+        let mut cmd = std::process::Command::new(&launcher);
+        cmd.arg(&url)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+            .stderr(std::process::Stdio::null());
+        if std::env::var_os("WAYLAND_DISPLAY")
+            .map(|v| v.is_empty()).unwrap_or(true)
+        {
+            cmd.env("XDG_SESSION_TYPE", "x11");
+            cmd.env("ELECTRON_OZONE_PLATFORM_HINT", "x11");
+        }
+        let spawned = cmd.spawn();
         match spawned {
             Ok(_) if !fallback => self.show_feedback(
                 &format!("Joining via {}…", launcher), 156),
