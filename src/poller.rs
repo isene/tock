@@ -183,10 +183,11 @@ fn sync_google_calendar(
     let time_min = ts_to_rfc3339(range_start);
     let time_max = ts_to_rfc3339(range_end);
 
-    let events = match gc.fetch_events(google_calendar_id, &time_min, &time_max) {
-        Some(evts) => evts,
-        None => return false,
-    };
+    let (events, cancelled) =
+        match gc.fetch_events_with_cancellations(google_calendar_id, &time_min, &time_max) {
+            Some(pair) => pair,
+            None => return false,
+        };
 
     let mut any_new = false;
     for mut ev in events {
@@ -194,6 +195,17 @@ fn sync_google_calendar(
         match db.upsert_synced_event(cal.id, &ev) {
             Ok(SyncResult::New) => any_new = true,
             Ok(SyncResult::Updated) => any_new = true,
+            _ => {}
+        }
+    }
+
+    // Drop any local rows the remote now reports as cancelled. This
+    // is how an attendee's calendar learns the organizer cancelled
+    // the meeting — without it, the row sits forever showing
+    // "Needs response" for an event that no longer exists.
+    for ext_id in &cancelled {
+        match db.delete_event_by_external_id(cal.id, ext_id) {
+            Ok(removed) if removed > 0 => any_new = true,
             _ => {}
         }
     }

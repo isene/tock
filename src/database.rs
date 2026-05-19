@@ -613,13 +613,12 @@ impl Database {
         &self,
         calendar_id: i64,
         external_id: &str,
-    ) -> rusqlite::Result<()> {
+    ) -> rusqlite::Result<usize> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "DELETE FROM events WHERE calendar_id = ?1 AND external_id = ?2",
             params![calendar_id, external_id],
-        )?;
-        Ok(())
+        )
     }
 
     // -----------------------------------------------------------------------
