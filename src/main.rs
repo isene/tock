@@ -709,8 +709,15 @@ impl App {
 
         let phase = orbit::moon_phase(sy, sm, sd);
         let moon_color = body_color("moon");
+        // orbit returns the U+1F311–18 emoji moon set; those render
+        // as 2-cell colour icons in most font stacks and pick up a
+        // grey fallback glyph next to them in some terminals — the
+        // "two moons" effect. Use the same text-presentation glyph
+        // tock already uses for the moon body (☾ + VS-15); the phase
+        // name + illumination carry the phase info.
         let moon = format!("  {} {} ({}%)",
-            style::fg_rgb(phase.symbol, &moon_color), phase.phase_name,
+            style::fg_rgb("\u{263E}\u{FE0E}", &moon_color),
+            phase.phase_name,
             (phase.illumination * 100.0).round() as i32);
 
         let lat = self.config.get_f64("location.lat", 59.9139);
@@ -2885,12 +2892,28 @@ impl App {
         if !goto_file.exists() { return; }
         if let Ok(content) = std::fs::read_to_string(&goto_file) {
             let _ = std::fs::remove_file(&goto_file);
+            // kastrup writes goto immediately after dropping an ICS in
+            // ~/.tock/incoming/, so a fresh goto is also the wake
+            // signal that the inbox has something new. Drain incoming
+            // before navigating so the event the user is about to look
+            // at actually exists in the DB. Free piggyback — no new
+            // polling, no new syscalls in the no-goto path (goto stat
+            // is the gate).
+            let cal_id = self.config.get_i64("default_calendar", 1);
+            let imported = ics::watch_incoming(&self.db, cal_id);
+            if imported > 0 { self.load_events_for_range(); }
+
             let content = content.trim().to_string();
-            if content.is_empty() { return; }
+            if content.is_empty() {
+                if imported > 0 { self.render_all(); }
+                return;
+            }
             if let Some(parsed) = self.parse_go_to_input(&content) {
                 self.selected_date = parsed;
                 self.selected_event_index = 0;
                 self.load_events_for_range();
+                self.render_all();
+            } else if imported > 0 {
                 self.render_all();
             }
         }
