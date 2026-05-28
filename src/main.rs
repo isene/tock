@@ -2372,22 +2372,113 @@ impl App {
         self.show_feedback("Google Calendar: see credentials setup documentation", 245);
     }
 
+    /// Outlook device-code auth / re-auth. Microsoft Conditional-Access
+    /// policies cap refresh-token lifetime (e.g. Dualog: 90 days), after
+    /// which sync silently stops with AADSTS70043 — this is how the user
+    /// renews it without leaving the TUI. Existing Outlook calendars are
+    /// re-authenticated in place (their tokens updated); the client_id /
+    /// tenant default to whatever those calendars already use.
+    ///
+    /// Note: `poll_for_token` blocks the UI until the user finishes the
+    /// browser sign-in (or the device code expires). That's acceptable
+    /// for a deliberate, infrequent action.
     fn setup_outlook_calendar(&mut self) {
-        self.blank_bottom(&style::bold(&style::fg(" Outlook/365 Calendar Setup", 33)));
-        let default_client_id = self.config.get_str("outlook.client_id", "");
-        let client_id = self.bottom_ask(" Azure App client_id: ", &default_client_id);
+        self.blank_bottom(&style::bold(&style::fg(" Outlook/365 Calendar Re-auth", 33)));
+
+        // Existing Outlook calendars seed the client_id / tenant so a
+        // re-auth reuses the same Azure app registration.
+        let existing: Vec<crate::database::Calendar> = self.db.get_calendars(false)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|c| c.source_type == "outlook")
+            .collect();
+        let (def_cid, def_tenant) = existing.first()
+            .and_then(|c| c.source_config.as_deref())
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .map(|cfg| (
+                cfg.get("client_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                cfg.get("tenant_id").and_then(|v| v.as_str()).unwrap_or("common").to_string(),
+            ))
+            .unwrap_or_else(|| (
+                self.config.get_str("outlook.client_id", ""),
+                self.config.get_str("outlook.tenant_id", "common"),
+            ));
+
+        let client_id = self.bottom_ask(" Azure App client_id: ", &def_cid);
         if client_id.trim().is_empty() { self.render_all(); return; }
+        let client_id = client_id.trim().to_string();
+        let tenant_in = self.bottom_ask(
+            &format!(" Tenant ID (Enter for '{}'): ", def_tenant), &def_tenant);
+        let tenant_id = if tenant_in.trim().is_empty() { def_tenant.clone() } else { tenant_in.trim().to_string() };
 
-        let default_tenant = self.config.get_str("outlook.tenant_id", "common");
-        let tenant_id = self.bottom_ask(
-            &format!(" Tenant ID (Enter for '{}'): ", default_tenant), &default_tenant);
-        let tenant_id = if tenant_id.trim().is_empty() { default_tenant } else { tenant_id.trim().to_string() };
-
-        self.config.set("outlook.client_id", serde_yaml::Value::String(client_id.trim().to_string()));
+        self.config.set("outlook.client_id", serde_yaml::Value::String(client_id.clone()));
         self.config.set("outlook.tenant_id", serde_yaml::Value::String(tenant_id.clone()));
         let _ = self.config.save();
 
-        self.show_feedback("Outlook Calendar: device code auth not yet integrated in Tock", 245);
+        // Kick off the device-code flow.
+        let auth_cfg = serde_json::json!({ "client_id": client_id, "tenant_id": tenant_id });
+        let mut oc = sources::outlook::OutlookCalendar::new(&auth_cfg);
+        let dev = match oc.start_device_auth() {
+            Some(v) => v,
+            None => {
+                self.show_feedback(&format!("Device auth failed: {}",
+                    oc.last_error.clone().unwrap_or_default()), 196);
+                self.render_all();
+                return;
+            }
+        };
+        let user_code = dev.get("user_code").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let uri = dev.get("verification_uri").and_then(|v| v.as_str())
+            .unwrap_or("https://microsoft.com/devicelogin").to_string();
+        let device_code = dev.get("device_code").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+        // Show the code + URL, then block on the poll. The bottom line
+        // stays put while the UI is frozen during sign-in.
+        self.blank_bottom(&style::bold(&style::fg(
+            &format!(" Open {}  —  enter code  {}   (signing in… UI waits)", uri, user_code), 46)));
+
+        let tok = match oc.poll_for_token(&device_code) {
+            Some(t) => t,
+            None => {
+                self.show_feedback(&format!("Auth failed/expired: {}",
+                    oc.last_error.clone().unwrap_or_default()), 196);
+                self.render_all();
+                return;
+            }
+        };
+
+        if existing.is_empty() {
+            self.show_feedback(
+                "Authenticated, but no existing Outlook calendar to attach (provision one first).", 220);
+            self.render_all();
+            return;
+        }
+
+        // Re-auth in place: write the fresh tokens into every Outlook
+        // calendar's source_config (keeping client_id / tenant / the
+        // outlook_calendar_id already stored there).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64).unwrap_or(0);
+        let mut updated = 0;
+        for c in &existing {
+            let mut cfg: serde_json::Value = c.source_config.as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            cfg["client_id"] = serde_json::json!(client_id);
+            cfg["tenant_id"] = serde_json::json!(tenant_id);
+            cfg["access_token"] = serde_json::json!(tok.access_token);
+            if let Some(rt) = &tok.refresh_token {
+                cfg["refresh_token"] = serde_json::json!(rt);
+            }
+            let s = serde_json::to_string(&cfg).unwrap_or_default();
+            if self.db.update_calendar_sync(c.id, now, Some(&s)).is_ok() {
+                updated += 1;
+            }
+        }
+        self.show_feedback(
+            &format!("Outlook re-authenticated ({} calendar(s)). Press S to sync.", updated), 46);
+        self.render_all();
     }
 
     fn manual_sync(&mut self) {
