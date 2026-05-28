@@ -507,10 +507,19 @@ impl App {
         let slot_start = date_to_ts(sy, sm, sd, hour as u32, minute as u32, 0) - tz;
         let slot_end = slot_start + 1800;
 
-        events.iter().find(|e| {
-            if e.all_day { return false; }
-            e.start_time < slot_end && e.end_time > slot_start
-        }).cloned()
+        let overlaps = |e: &Event| !e.all_day && e.start_time < slot_end && e.end_time > slot_start;
+
+        // When several events share this slot, return the one the user
+        // has cycled to with e/E (selected_event_index) — not always the
+        // first — so every event sharing a slot is reachable for view
+        // and edit. Falls back to the first overlapping event when the
+        // index points elsewhere (e.g. after arrow-key navigation).
+        if let Some(sel) = events.get(self.selected_event_index) {
+            if overlaps(sel) {
+                return Some(sel.clone());
+            }
+        }
+        events.iter().find(|e| overlaps(e)).cloned()
     }
 
     fn select_next_event_on_day(&mut self) {
@@ -1132,6 +1141,11 @@ impl App {
         if self.slot_offset > max_offset { self.slot_offset = max_offset; }
 
         let end_slot = (self.slot_offset + available).min(48);
+        // Id of the event the user has cycled to (e/E). Lets a slot
+        // shared by several events show the selected one in the grid;
+        // the rest are flagged with a "+N" badge and reachable via e/E.
+        let sel_event_id: Option<i64> = self.events_on_selected_day()
+            .get(self.selected_event_index).map(|e| e.id);
         for slot_idx in self.slot_offset..end_slot {
             let hour = slot_idx / 2;
             let minute = (slot_idx % 2) * 30;
@@ -1162,9 +1176,20 @@ impl App {
                     hour as u32, minute as u32, 0) - tz;
                 let day_ts_end = day_ts_start + 1800;
 
-                let evt_opt = week_events[col as usize].iter().find(|e| {
-                    e.start_time < day_ts_end && e.end_time > day_ts_start
-                });
+                let overlapping: Vec<&Event> = week_events[col as usize].iter()
+                    .filter(|e| e.start_time < day_ts_end && e.end_time > day_ts_start)
+                    .collect();
+                // At the selected day+slot, draw the event the user has
+                // cycled to so events sharing the slot are each reachable;
+                // elsewhere the first.
+                let evt_opt: Option<&Event> = if is_sel && is_slot_selected {
+                    sel_event_id
+                        .and_then(|id| overlapping.iter().find(|e| e.id == id).copied())
+                        .or_else(|| overlapping.first().copied())
+                } else {
+                    overlapping.first().copied()
+                };
+                let extra = overlapping.len().saturating_sub(1);
 
                 let cell = if let Some(evt) = evt_opt {
                     let is_at_slot = is_sel && is_slot_selected;
@@ -1193,7 +1218,10 @@ impl App {
                         } else {
                             format!("{} {}", rsvp, title)
                         };
-                        let mut entry = format!("{}{}", marker, labeled);
+                        // Flag a slot shared by multiple events so the
+                        // hidden ones are discoverable (cycle with e/E).
+                        let badge = if extra > 0 { format!(" +{}", extra) } else { String::new() };
+                        let mut entry = format!("{}{}{}", marker, labeled, badge);
                         if entry.len() > day_col {
                             entry = format!("{}.", truncate_str(&entry, day_col.saturating_sub(1)));
                         }
