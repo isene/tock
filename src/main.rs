@@ -89,6 +89,27 @@ fn date_to_ts(year: i32, month: u32, day: u32, hour: u32, min: u32, sec: u32) ->
     days * 86400 + hour as i64 * 3600 + min as i64 * 60 + sec as i64
 }
 
+/// `(start, end)` for an all-day event covering `days` whole days from
+/// `(y,m,d)`. Stored as **UTC midnight** — the convention the renderer
+/// reads (it takes the UTC date of `start_time`). Local-midnight
+/// storage (`date_to_ts - tz`) put the event one offset before UTC
+/// midnight, so its UTC date fell on the previous day and it rendered
+/// on two days. `end` is exclusive (UTC midnight after the last day).
+fn all_day_range(y: i32, m: u32, d: u32, days: i64) -> (i64, i64) {
+    let start = date_to_ts(y, m, d, 0, 0, 0);
+    (start, start + days.max(1) * 86400)
+}
+
+/// Parse `YYYY-MM-DD` → `(y, m, d)`. `None` on malformed input.
+fn parse_ymd(s: &str) -> Option<(i32, u32, u32)> {
+    let p: Vec<&str> = s.trim().split('-').collect();
+    if p.len() != 3 { return None; }
+    let y = p[0].parse::<i32>().ok()?;
+    let m = p[1].parse::<u32>().ok()?;
+    let d = p[2].parse::<u32>().ok()?;
+    if (1..=12).contains(&m) && (1..=31).contains(&d) { Some((y, m, d)) } else { None }
+}
+
 fn ts_to_parts(ts: i64) -> (i32, u32, u32, u32, u32, u32) {
     let secs = ts.rem_euclid(86400);
     let days = ts.div_euclid(86400);
@@ -1636,8 +1657,13 @@ impl App {
         let tz = local_tz_offset_secs();
 
         let (start_ts, end_ts) = if all_day {
-            let s = date_to_ts(sy, sm, sd, 0, 0, 0) - tz;
-            (s, s + 86400)
+            // Multi-day all-day: ask how many whole days it spans.
+            self.blank_bottom(&style::bold(&style::fg(
+                &format!(" {} (all day)", title), cal_color)));
+            let days_str = self.bottom_ask(" Number of days: ", "1");
+            if days_str.is_empty() { self.render_all(); return; }
+            let days: i64 = days_str.trim().parse().unwrap_or(1).max(1);
+            all_day_range(sy, sm, sd, days)
         } else {
             let parts: Vec<&str> = time_str.trim().split(':').collect();
             let hour: u32 = parts.first().and_then(|p| p.parse().ok()).unwrap_or(9);
@@ -1721,27 +1747,100 @@ impl App {
             Some(e) => e,
             None => { self.show_feedback("No event at this time slot", 245); return; }
         };
+        let tz = local_tz_offset_secs();
 
+        // Current date/time of the event for prefills: UTC date for
+        // all-day (matches storage), local wall-clock for timed.
+        let (cy, cm, cd, csh, csmn, _) = if evt.all_day {
+            ts_to_parts(evt.start_time)
+        } else {
+            ts_to_parts(evt.start_time + tz)
+        };
+        let span_secs = (evt.end_time - evt.start_time).max(0);
+
+        // Title
         self.blank_bottom(&style::bold(" Edit Event"));
         let new_title = self.bottom_ask(" Title: ", &evt.title);
-        if new_title.is_empty() { self.render_all(); return; }
+        if new_title.trim().is_empty() { self.render_all(); return; }
+        let new_title = new_title.trim().to_string();
+
+        // Date
+        self.blank_bottom(&style::bold(&format!(" {} — date", new_title)));
+        let date_def = format!("{:04}-{:02}-{:02}", cy, cm, cd);
+        let date_in = self.bottom_ask(" Date (YYYY-MM-DD): ", &date_def);
+        if date_in.is_empty() { self.render_all(); return; }
+        let (dy, dm, dd) = parse_ymd(&date_in).unwrap_or((cy, cm, cd));
+
+        // Time / all-day
+        let time_def = if evt.all_day { "all day".to_string() }
+            else { format!("{:02}:{:02}", csh, csmn) };
+        self.blank_bottom(&style::bold(&format!(" {} — time", new_title)));
+        let time_str = self.bottom_ask(" Start time (HH:MM or 'all day'): ", &time_def);
+        if time_str.is_empty() { self.render_all(); return; }
+        let all_day = time_str.trim().to_lowercase() == "all day";
+
+        let (start_ts, end_ts) = if all_day {
+            let cur_days = (span_secs / 86400).max(1);
+            self.blank_bottom(&style::bold(&format!(" {} (all day)", new_title)));
+            let days_str = self.bottom_ask(" Number of days: ", &cur_days.to_string());
+            let days: i64 = days_str.trim().parse().unwrap_or(cur_days).max(1);
+            all_day_range(dy, dm, dd, days)
+        } else {
+            let parts: Vec<&str> = time_str.trim().split(':').collect();
+            let hour: u32 = parts.first().and_then(|p| p.parse().ok()).unwrap_or(9);
+            let minute: u32 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(0);
+            let s = date_to_ts(dy, dm, dd, hour, minute, 0) - tz;
+            let cur_dur = if evt.all_day || span_secs == 0 { 60 } else { (span_secs / 60).max(1) };
+            self.blank_bottom(&style::bold(&format!(" {} at {}", new_title, time_str.trim())));
+            let dur_str = self.bottom_ask(" Duration in minutes: ", &cur_dur.to_string());
+            let duration: i64 = dur_str.trim().parse().unwrap_or(cur_dur).max(1);
+            (s, s + duration * 60)
+        };
+
+        // Location
+        let loc_def = evt.location.clone().unwrap_or_default();
+        self.blank_bottom(&style::bold(&format!(" {} — location", new_title)));
+        let loc_in = self.bottom_ask(" Location (Enter to skip): ", &loc_def);
+        let location = if loc_in.trim().is_empty() { None } else { Some(loc_in.trim().to_string()) };
+
+        // Invitees (prefill from current attendees' emails)
+        let inv_def = evt.attendees.as_ref()
+            .and_then(|a| a.as_array())
+            .map(|arr| arr.iter()
+                .filter_map(|e| e.get("email").and_then(|v| v.as_str()))
+                .collect::<Vec<_>>().join(", "))
+            .unwrap_or_default();
+        self.blank_bottom(&style::bold(&format!(" {} — invitees", new_title)));
+        let inv_in = self.bottom_ask(" Invite (comma emails, Enter to skip): ", &inv_def);
+        let attendees = if inv_in.trim().is_empty() { None } else {
+            let arr: Vec<serde_json::Value> = inv_in.split(',')
+                .map(|e| serde_json::json!({"email": e.trim()}))
+                .collect();
+            Some(serde_json::Value::Array(arr))
+        };
+
+        // Description
+        let desc_def = evt.description.clone().unwrap_or_default();
+        self.blank_bottom(&style::bold(&format!(" {} — description", new_title)));
+        let desc_in = self.bottom_ask(" Description (Enter to skip): ", &desc_def);
+        let description = if desc_in.trim().is_empty() { None } else { Some(desc_in.trim().to_string()) };
 
         let data = EventData {
             id: Some(evt.id),
             calendar_id: evt.calendar_id,
             external_id: evt.external_id.clone(),
-            title: new_title.trim().to_string(),
-            description: evt.description.clone(),
-            location: evt.location.clone(),
-            start_time: evt.start_time,
-            end_time: evt.end_time,
-            all_day: evt.all_day,
+            title: new_title,
+            description,
+            location,
+            start_time: start_ts,
+            end_time: end_ts,
+            all_day,
             timezone: evt.timezone.clone(),
             recurrence_rule: evt.recurrence_rule.clone(),
             series_master_id: evt.series_master_id,
             status: evt.status.clone(),
             organizer: evt.organizer.clone(),
-            attendees: evt.attendees.clone(),
+            attendees,
             my_status: evt.my_status.clone(),
             alarms: evt.alarms.clone(),
             metadata: evt.metadata.clone(),
