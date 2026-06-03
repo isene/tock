@@ -1292,64 +1292,72 @@ impl App {
 
         let evt = self.event_at_selected_slot();
         if let Some(evt) = evt {
+            // Kastrup-style detail: a coloured title, a full-width rule, then
+            // aligned "Label: value" rows (When / Where / Organizer /
+            // Attendees / Calendar / Status / Join), then the human part of
+            // the description with meeting boilerplate stripped out.
             let color = evt.calendar_color as u8;
+            let tz = local_tz_offset_secs();
+            const LBL: u8 = 73;   // field label (teal)
+            const VAL: u8 = 252;  // primary value
+            const DIM: u8 = 245;  // secondary value
+            let label_w = 10;     // pads "Attendees:" so colons align
+            let max_val = w.saturating_sub(label_w + 3);
+            let rule = || style::fg(&"\u{2500}".repeat(w.saturating_sub(1)), 238);
+
+            // Title (bold, calendar colour, RSVP marker prefix)
             let title_only = if evt.title.is_empty() { "(No title)".to_string() } else { evt.title.clone() };
             let rsvp = rsvp_marker(evt.my_status.as_deref());
             let title = if rsvp.is_empty() { title_only } else { format!("{} {}", rsvp, title_only) };
-            let tz = local_tz_offset_secs();
+            lines.push(format!(" {}", style::bold(&style::fg(&truncate_str(&title, w.saturating_sub(2)), color))));
+            lines.push(rule());
 
-            let time_info = if evt.all_day {
+            // When
+            let when = if evt.all_day {
                 format!("{}-{:02}-{:02}  All day", sy, sm, sd)
             } else {
-                let local_s = evt.start_time + tz;
-                let (_, _, _, sh, smn, _) = ts_to_parts(local_s);
-                let local_e = evt.end_time + tz;
-                let (_, _, _, eh, emn, _) = ts_to_parts(local_e);
-                let swd = cwday(sy, sm, sd);
+                let (_, _, _, sh, smn, _) = ts_to_parts(evt.start_time + tz);
+                let (_, _, _, eh, emn, _) = ts_to_parts(evt.end_time + tz);
                 format!("{} {}-{:02}-{:02}  {:02}:{:02} - {:02}:{:02}",
-                    weekday_short(swd), sy, sm, sd, sh, smn, eh, emn)
+                    weekday_short(cwday(sy, sm, sd)), sy, sm, sd, sh, smn, eh, emn)
             };
-
-            lines.push(format!(" {}  {}",
-                style::bold(&style::fg(&title, color)),
-                style::fg(&time_info, 252)));
-
-            // Details line
-            let mut details: Vec<String> = Vec::new();
+            if let Some(l) = fmt_field("When", label_w, &when, max_val, LBL, VAL) { lines.push(l); }
             if let Some(ref loc) = evt.location {
-                let loc = loc.trim();
-                if !loc.is_empty() { details.push(format!("Location: {}", loc)); }
+                if let Some(l) = fmt_field("Where", label_w, loc.trim(), max_val, LBL, VAL) { lines.push(l); }
             }
             if let Some(ref org) = evt.organizer {
-                let org = org.trim();
-                if !org.is_empty() { details.push(format!("Organizer: {}", org)); }
+                if let Some(l) = fmt_field("Organizer", label_w, org.trim(), max_val, LBL, DIM) { lines.push(l); }
             }
-            details.push(format!("Calendar: {}", evt.calendar_name));
-            let detail_line = format!(" {}", details.join("  |  "));
-            let detail_line = truncate_str(&detail_line, w.saturating_sub(2));
-            lines.push(style::fg(&detail_line, 245));
+            if let Some(ref att) = evt.attendees {
+                if let Some(line) = attendee_line(att, max_val) {
+                    let lbl = format!("{:<width$}", "Attendees:", width = label_w);
+                    lines.push(format!(" {} {}", style::fg(&lbl, LBL), line));
+                }
+            }
+            if let Some(l) = fmt_field("Calendar", label_w, &evt.calendar_name, max_val, LBL, DIM) { lines.push(l); }
+            // Status: my RSVP, plus the event status unless it's the boring default.
+            let mut st: Vec<String> = Vec::new();
+            if let Some(ref ms) = evt.my_status { st.push(humanize_status(ms).to_string()); }
+            if !evt.status.is_empty() && !evt.status.eq_ignore_ascii_case("confirmed") {
+                st.push(evt.status.clone());
+            }
+            if let Some(l) = fmt_field("Status", label_w, &st.join("  |  "), max_val, LBL, DIM) { lines.push(l); }
+            // Join link extracted from the description (or location).
+            let join = evt.description.as_deref().and_then(extract_meeting_link)
+                .or_else(|| evt.location.as_deref().and_then(extract_meeting_link));
+            if let Some(ref url) = join {
+                let lbl = format!("{:<width$}", "Join:", width = label_w);
+                lines.push(format!(" {} {}", style::fg(&lbl, 40), style::fg(&truncate_str(url, max_val), 39)));
+            }
 
-            // Status
-            let mut status_parts: Vec<String> = Vec::new();
-            if !evt.status.is_empty() {
-                status_parts.push(format!("Status: {}", evt.status));
-            }
-            if let Some(ref ms) = evt.my_status {
-                status_parts.push(format!("My status: {}", humanize_status(ms)));
-            }
-            if !status_parts.is_empty() {
-                lines.push(style::fg(&format!(" {}", status_parts.join("  |  ")), 245));
-            }
-
-            // Description
+            // Description — boilerplate-stripped, word-wrapped to full width.
             if let Some(ref desc) = evt.description {
-                let desc = clean_description(desc);
-                if !desc.is_empty() {
-                    let desc_flat = desc.replace('\n', " ").replace('\r', "");
-                    lines.push(String::new());
-                    let max_lines = 50;
+                let cleaned = clean_meeting_desc(desc);
+                if !cleaned.is_empty() {
+                    lines.push(rule());
+                    let max_lines = self.bottom.h as usize;
                     let mut line = " ".to_string();
-                    for word in desc_flat.split_whitespace() {
+                    for word in cleaned.split_whitespace() {
                         if line.len() + word.len() + 1 > w.saturating_sub(2) {
                             lines.push(style::fg(&line, 248));
                             if lines.len() >= max_lines { break; }
@@ -2065,21 +2073,27 @@ impl App {
                     lines.push(String::new());
                     lines.push(format!("  {}", style::fg("Attendees:", 51)));
                     for a in arr {
-                        let name = a.get("name").or(a.get("email")).or(a.get("displayName"))
-                            .and_then(|v| v.as_str()).unwrap_or("?");
-                        let status = a.get("status").or(a.get("responseStatus"))
-                            .and_then(|v| v.as_str()).unwrap_or("");
-                        let status_str = if status.is_empty() { String::new() }
-                            else { style::fg(&format!("  ({})", status), 245) };
-                        lines.push(format!("    {}{}", style::fg(name, 252), status_str));
+                        // attendee_name_status normalises Google/Outlook/manual
+                        // shapes; the RSVP marker (✓/✗/?/·) leads each name.
+                        let Some((name, status)) = attendee_name_status(a) else { continue };
+                        let (marker, mcol) = rsvp_short(&status);
+                        lines.push(format!("    {} {}", style::fg(marker, mcol), style::fg(&name, 252)));
                     }
                 }
             }
         }
 
-        // Description
+        // Join link (extracted from the description / location)
+        let join = evt.description.as_deref().and_then(extract_meeting_link)
+            .or_else(|| evt.location.as_deref().and_then(extract_meeting_link));
+        if let Some(ref url) = join {
+            lines.push(String::new());
+            lines.push(format!("  {} {}", style::fg("Join:", 40), style::fg(url, 39)));
+        }
+
+        // Description (meeting boilerplate stripped — join link is shown above)
         if let Some(ref desc) = evt.description {
-            let desc = clean_description(desc);
+            let desc = clean_meeting_desc(desc);
             if !desc.is_empty() {
                 lines.push(String::new());
                 let sep_w = (pw as usize).saturating_sub(6).max(1);
@@ -3241,6 +3255,119 @@ fn clean_description(desc: &str) -> String {
     let desc = re_box.replace_all(&desc, "");
     let desc = re_blanks.replace_all(&desc, "\n\n");
     desc.trim().to_string()
+}
+
+/// One "Label:    value" detail row, kastrup-style: the label is padded
+/// to `label_w`, coloured `lcol`; the value is colour `vcol`, truncated to
+/// the remaining width. None when the value is blank (so empty fields are
+/// skipped rather than printing a bare label).
+fn fmt_field(label: &str, label_w: usize, value: &str, max_val: usize, lcol: u8, vcol: u8) -> Option<String> {
+    if value.trim().is_empty() { return None; }
+    let lbl = format!("{:<width$}", format!("{}:", label), width = label_w);
+    Some(format!(" {} {}", style::fg(&lbl, lcol), style::fg(&truncate_str(value, max_val), vcol)))
+}
+
+/// Attendee RSVP → (marker, colour). Covers Google (`responseStatus`) and
+/// Outlook (`status.response`) vocabularies.
+fn rsvp_short(status: &str) -> (&'static str, u8) {
+    match status.to_ascii_lowercase().as_str() {
+        "accepted"                            => ("\u{2713}", 40),  // ✓ green
+        "declined"                            => ("\u{2717}", 167), // ✗ red
+        "tentative" | "tentativelyaccepted"   => ("?", 179),        // amber
+        _                                     => ("\u{00B7}", 244), // · grey (no response)
+    }
+}
+
+/// Normalise one attendee object into (display name, raw status), handling
+/// the three shapes tock stores: Outlook `{emailAddress:{address,name},
+/// status:{response}}`, Google `{email,displayName,responseStatus}`, and
+/// the manual `{email}`. Display prefers a real name, else the email's
+/// local part for compactness.
+fn attendee_name_status(a: &serde_json::Value) -> Option<(String, String)> {
+    let (name, email) = match a.get("emailAddress") {
+        Some(ea) => (
+            ea.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            ea.get("address").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        ),
+        None => (
+            a.get("displayName").and_then(|v| v.as_str())
+                .or_else(|| a.get("name").and_then(|v| v.as_str())).unwrap_or("").to_string(),
+            a.get("email").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        ),
+    };
+    let disp = if !name.trim().is_empty() { name.trim().to_string() }
+        else if !email.is_empty() { email.split('@').next().unwrap_or(&email).to_string() }
+        else { return None };
+    let status = a.get("responseStatus").and_then(|v| v.as_str())
+        .or_else(|| a.get("status").and_then(|s| s.get("response")).and_then(|v| v.as_str()))
+        .unwrap_or("").to_string();
+    Some((disp, status))
+}
+
+/// Render the attendee list as `Name ✓  Name ?  …  (total)`, coloured by
+/// RSVP, fitted to `max_w` plain columns (overflow collapses to `+N`).
+fn attendee_line(attendees: &serde_json::Value, max_w: usize) -> Option<String> {
+    let arr = attendees.as_array()?;
+    if arr.is_empty() { return None; }
+    let total = arr.len();
+    let mut parts: Vec<String> = Vec::new();
+    let mut used = 0usize;
+    let mut shown = 0usize;
+    for a in arr {
+        let Some((name, status)) = attendee_name_status(a) else { continue };
+        let (marker, mcol) = rsvp_short(&status);
+        let plain = format!("{} {}", name, marker);
+        if shown > 0 && used + plain.len() + 2 > max_w {
+            parts.push(style::fg(&format!("+{}", total - shown), 245));
+            break;
+        }
+        parts.push(format!("{} {}", style::fg(&name, 250), style::fg(marker, mcol)));
+        used += plain.len() + 2;
+        shown += 1;
+    }
+    if parts.is_empty() { return None; }
+    Some(format!("{}  {}", parts.join("  "), style::fg(&format!("({})", total), 245)))
+}
+
+/// Pull the first video-meeting join URL out of a description/location
+/// (Teams, Zoom, Google Meet, Whereby, Webex). The "Bli med:/Join:" short
+/// link sorts first in Teams invites, so the first match is the clean one.
+fn extract_meeting_link(text: &str) -> Option<String> {
+    let re = regex::Regex::new(
+        r"https://[^\s<>|)\]]*(?:teams\.microsoft\.com/(?:meet|l/meetup-join)|zoom\.us/j/|meet\.google\.com/|whereby\.com/|webex\.com)[^\s<>|)\]]*"
+    ).ok()?;
+    re.find(text).map(|m| m.as_str().trim_end_matches(['>', ')', ']', '.', ',']).to_string())
+}
+
+/// Strip auto-generated meeting boilerplate (the Teams/Zoom join block,
+/// dial-in numbers, passcodes, help links, logo images) so the detail pane
+/// shows only the human-written description. The join URL is surfaced
+/// separately as its own field, so dropping it here is intentional.
+fn clean_meeting_desc(desc: &str) -> String {
+    let base = clean_description(desc);
+    let img_re = regex::Regex::new(r"\[[^\]]*?(?:https?://|\.(?:png|jpg|jpeg|gif|svg))[^\]]*\]").unwrap();
+    const NOISE: &[&str] = &[
+        "teams.microsoft.com", "microsoft teams", "bli med", "join the meeting",
+        "møte-id", "meeting id", "passord", "passcode", "aka.ms", "pexip",
+        "videokonferanse", "video conference", "videokonferanseenhet",
+        "leiers nøkkel", "tenant key", "video-id", "video id",
+        "mer informasjon", "more info", "møtealternativer", "meeting options",
+        "zoom.us", "meet.google.com", "whereby.com", "webex.com",
+        "trenger du hjelp", "need help", "systemreferanse", "for arrangører",
+        "for organizers", "________",
+    ];
+    let mut out: Vec<String> = Vec::new();
+    for raw in base.lines() {
+        let line = img_re.replace_all(raw, "");
+        let l = line.trim();
+        if l.is_empty() { out.push(String::new()); continue; }
+        let low = l.to_lowercase();
+        if NOISE.iter().any(|n| low.contains(n)) { continue; }
+        out.push(l.to_string());
+    }
+    let joined = out.join("\n");
+    let re_blanks = regex::Regex::new(r"\n{2,}").unwrap();
+    re_blanks.replace_all(joined.trim(), "\n").to_string()
 }
 
 fn shellexpand(path: &str) -> String {
