@@ -1,5 +1,8 @@
 // Outlook / Microsoft 365 Graph API integration for Tock.
 // Ported from Timely's Ruby implementation; uses ureq for HTTP.
+// Some CRUD / listing entry points are ported ahead of being wired into
+// the TUI; allow the unused surface rather than dropping the integration.
+#![allow(dead_code)]
 
 use crate::database::EventData;
 use serde_json::{json, Value};

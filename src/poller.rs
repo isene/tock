@@ -7,7 +7,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::config::Config;
-use crate::database::{now_secs, Database, EventData, SyncResult};
+use crate::database::{now_secs, Database, SyncResult};
 use crate::notifications;
 
 // ---------------------------------------------------------------------------
