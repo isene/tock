@@ -4,7 +4,6 @@
 use serde_yaml::Value;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::LazyLock;
 
 /// User home directory.
 pub fn home_dir() -> PathBuf {
@@ -19,25 +18,10 @@ pub fn tock_home() -> PathBuf {
     home_dir().join(".tock")
 }
 
-/// ~/.tock/tock.db
-pub fn tock_db() -> PathBuf {
-    tock_home().join("tock.db")
-}
-
 /// ~/.tock/config.yml
 pub fn tock_config() -> PathBuf {
     tock_home().join("config.yml")
 }
-
-/// Exported path constants (computed once, accessible as &PathBuf).
-pub static TOCK_HOME: LazyLock<PathBuf> = LazyLock::new(tock_home);
-pub static TOCK_DB: LazyLock<PathBuf> = LazyLock::new(tock_db);
-pub static TOCK_CONFIG: LazyLock<PathBuf> = LazyLock::new(tock_config);
-
-// Keep old names as aliases for compatibility with other modules
-pub fn timely_home() -> PathBuf { tock_home() }
-pub fn timely_db() -> PathBuf { tock_db() }
-pub fn timely_config() -> PathBuf { tock_config() }
 
 /// Build the default configuration as a serde_yaml::Value tree.
 fn default_config() -> Value {
@@ -198,13 +182,6 @@ impl Config {
         }
     }
 
-    pub fn get_bool(&self, key_path: &str, default: bool) -> bool {
-        match self.resolve(key_path) {
-            Some(Value::Bool(b)) => *b,
-            _ => default,
-        }
-    }
-
     pub fn set(&mut self, key_path: &str, value: Value) {
         let slot = self.resolve_mut(key_path);
         *slot = value;
@@ -226,17 +203,5 @@ impl Config {
         let yaml = serde_yaml::to_string(&merged)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         fs::write(&self.path, yaml)
-    }
-
-    pub fn reload(&mut self) {
-        let mut data = default_config();
-        if self.path.exists() {
-            if let Ok(contents) = fs::read_to_string(&self.path) {
-                if let Ok(file_val) = serde_yaml::from_str::<Value>(&contents) {
-                    deep_merge(&mut data, &file_val);
-                }
-            }
-        }
-        self.data = data;
     }
 }

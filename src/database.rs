@@ -40,8 +40,6 @@ pub struct Calendar {
     pub source_config: Option<String>,
     pub color: i64,
     pub enabled: bool,
-    pub sync_token: Option<String>,
-    pub last_synced_at: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -416,12 +414,10 @@ impl Database {
     pub fn get_calendars(&self, enabled_only: bool) -> rusqlite::Result<Vec<Calendar>> {
         let conn = self.conn.lock().unwrap();
         let sql = if enabled_only {
-            "SELECT id, name, source_type, source_config, color, enabled,
-                    sync_token, last_synced_at
+            "SELECT id, name, source_type, source_config, color, enabled
              FROM calendars WHERE enabled = 1 ORDER BY name"
         } else {
-            "SELECT id, name, source_type, source_config, color, enabled,
-                    sync_token, last_synced_at
+            "SELECT id, name, source_type, source_config, color, enabled
              FROM calendars ORDER BY name"
         };
         let mut stmt = conn.prepare(sql)?;
@@ -433,51 +429,9 @@ impl Database {
                 source_config: row.get(3)?,
                 color: row.get(4)?,
                 enabled: row.get::<_, i64>(5)? != 0,
-                sync_token: row.get(6)?,
-                last_synced_at: row.get(7)?,
             })
         })?;
         rows.collect()
-    }
-
-    /// Insert or update a calendar. Returns the row id.
-    pub fn save_calendar(&self, cal: &Calendar) -> rusqlite::Result<i64> {
-        let conn = self.conn.lock().unwrap();
-        if cal.id > 0 {
-            conn.execute(
-                "UPDATE calendars SET
-                    name = ?1, source_type = ?2, source_config = ?3,
-                    color = ?4, enabled = ?5, sync_token = ?6,
-                    last_synced_at = ?7
-                 WHERE id = ?8",
-                params![
-                    cal.name,
-                    cal.source_type,
-                    cal.source_config,
-                    cal.color,
-                    cal.enabled as i64,
-                    cal.sync_token,
-                    cal.last_synced_at,
-                    cal.id,
-                ],
-            )?;
-            Ok(cal.id)
-        } else {
-            conn.execute(
-                "INSERT INTO calendars
-                    (name, source_type, source_config, color, enabled, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    cal.name,
-                    cal.source_type,
-                    cal.source_config,
-                    cal.color,
-                    cal.enabled as i64,
-                    now_secs(),
-                ],
-            )?;
-            Ok(conn.last_insert_rowid())
-        }
     }
 
     pub fn update_calendar_color(&self, id: i64, color: i64) -> rusqlite::Result<()> {
@@ -523,31 +477,6 @@ impl Database {
                 params![last_synced_at, id],
             )?;
         }
-        Ok(())
-    }
-
-    // -----------------------------------------------------------------------
-    // Settings
-    // -----------------------------------------------------------------------
-
-    pub fn get_setting(&self, key: &str) -> rusqlite::Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT value FROM settings WHERE key = ?1",
-            params![key],
-            |r| r.get(0),
-        )
-        .optional()
-    }
-
-    pub fn set_setting(&self, key: &str, value: &str) -> rusqlite::Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO settings (key, value, updated_at)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = ?3",
-            params![key, value, now_secs()],
-        )?;
         Ok(())
     }
 
