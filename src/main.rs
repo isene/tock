@@ -2098,14 +2098,12 @@ impl App {
                 lines.push(String::new());
                 let sep_w = (pw as usize).saturating_sub(6).max(1);
                 lines.push(format!("  {}", style::fg(&"-".repeat(sep_w), 238)));
+                // Push each logical line; crust's pane word-wraps long
+                // lines on refresh (wrap/word_wrap default true). The old
+                // manual byte-slice wrap panicked on UTF-8 boundaries
+                // (Nordic å/ø/æ in Dualog descriptions).
                 for dline in desc.split('\n') {
-                    let mut remaining = dline.to_string();
-                    let max_w = pw as usize - 6;
-                    while remaining.len() > max_w {
-                        lines.push(style::fg(&format!("  {}", &remaining[..max_w]), 248));
-                        remaining = remaining[max_w..].to_string();
-                    }
-                    lines.push(style::fg(&format!("  {}", remaining), 248));
+                    lines.push(style::fg(&format!("  {}", dline), 248));
                 }
             }
         }
@@ -2114,7 +2112,7 @@ impl App {
         lines.push(format!("  {}", style::fg("UP/DOWN:scroll  C-Y:copy  ESC/q:close", 245)));
 
         popup.set_text(&lines.join("\n"));
-        popup.refresh();
+        popup.full_refresh(); // full_refresh draws the border; refresh() alone doesn't
 
         loop {
             let k = Input::getchr(None);
@@ -3227,14 +3225,34 @@ fn humanize_status(status: &str) -> &str {
 
 fn clean_description(desc: &str) -> String {
     let desc = desc.to_string();
-    // Strip HTML tags if it looks like HTML
+    // HTML → text (Outlook / Word descriptions). Order matters:
+    //   1) drop <style>/<head>/<script> blocks and comments outright;
+    //   2) collapse source whitespace — Word wraps the HTML with `\r\n\t`
+    //      every ~76 cols, which is NOT content (HTML ignores it);
+    //   3) turn block/break tags into real newlines;
+    //   4) strip remaining inline tags and decode entities.
+    // The old code replaced every tag with a space, which DROPPED the
+    // real <p>/<br> breaks while KEEPING the source wrapping as newlines —
+    // exactly backwards, producing fragmented text ("Need\nhelp?").
     let desc = if desc.trim_start().starts_with('<') {
-        let re = regex::Regex::new(r"<[^>]+>").unwrap();
-        re.replace_all(&desc, " ")
+        let blocks = regex::Regex::new(
+            r"(?is)<!--.*?-->|<style[^>]*>.*?</style>|<head[^>]*>.*?</head>|<script[^>]*>.*?</script>"
+        ).unwrap();
+        let desc = blocks.replace_all(&desc, " ");
+        let ws = regex::Regex::new(r"\s+").unwrap();
+        let desc = ws.replace_all(&desc, " ");
+        let brk = regex::Regex::new(
+            r"(?i)<br\s*/?>|</(?:p|div|li|tr|h[1-6]|ul|ol|table|blockquote)\s*>"
+        ).unwrap();
+        let desc = brk.replace_all(&desc, "\n");
+        let tags = regex::Regex::new(r"<[^>]+>").unwrap();
+        tags.replace_all(&desc, "")
             .replace("&nbsp;", " ")
             .replace("&amp;", "&")
             .replace("&lt;", "<")
             .replace("&gt;", ">")
+            .replace("&#39;", "'")
+            .replace("&quot;", "\"")
             .to_string()
     } else {
         desc
