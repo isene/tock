@@ -3571,6 +3571,28 @@ fn push_event_oneshot(event_id: i64) -> i32 {
 }
 
 fn main() {
+    // --help and --version answer before the TUI touches the terminal.
+    // A tool that asks what this is — the fe2o3 launcher's ? popup, a
+    // packaging script, a curious shell — should get an answer, not a
+    // screen paint.
+    if std::env::args().skip(1).any(|a| a == "-h" || a == "--help") {
+        println!("tock — Calendar with ephemeris (Fe2O3 suite)");
+        println!();
+        println!("Usage: tock [OPTIONS]");
+        println!();
+        println!("  --compose-to ADDR   open a compose window to ADDR (via kastrup)");
+        println!("  --subject TEXT      subject for --compose-to");
+        println!("  --push-event FILE   import an ICS file and exit");
+        println!();
+        println!("Day / week / month / year views, sun, moon and planets, Google and Outlook");
+        println!("sync. Drop .ics files in ~/.tock/incoming/ to import them.");
+        return;
+    }
+    if std::env::args().skip(1).any(|a| a == "-v" || a == "--version") {
+        println!("tock {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
     // CLI: `tock --push-event <id>` pushes a single local-only event to its
     // remote calendar (one-shot, no TUI). Used to backfill events that were
     // created before remote write-back was wired.
