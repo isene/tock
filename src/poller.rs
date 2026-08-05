@@ -281,6 +281,13 @@ fn sync_outlook_calendar(
         return false;
     }
 
+    // Persist the rotated tokens NOW, not after the fetch. Microsoft
+    // hands back a new refresh token and may retire the old one, so any
+    // gap between "the wire rotated it" and "we wrote it down" is a
+    // window where losing the process means re-authenticating by hand.
+    // The fetch below is seconds wide; this closes it.
+    persist_outlook_tokens(db, cal.id, &mut config, &oc);
+
     let time_min = ts_to_rfc3339(range_start);
     let time_max = ts_to_rfc3339(range_end);
 
@@ -299,17 +306,25 @@ fn sync_outlook_calendar(
         }
     }
 
-    // Persist refreshed tokens back to source_config
-    let new_config = if let Some(new_refresh) = oc.get_refresh_token() {
-        config["refresh_token"] = serde_json::json!(new_refresh);
-        if let Some(access) = oc.get_access_token_cached() {
-            config["access_token"] = serde_json::json!(access);
-        }
-        Some(serde_json::to_string(&config).unwrap_or_default())
-    } else {
-        None
-    };
-
-    let _ = db.update_calendar_sync(cal.id, now_secs(), new_config.as_deref());
+    // Stamp the sync time; the tokens went in before the fetch.
+    let _ = db.update_calendar_sync(cal.id, now_secs(), None);
     any_new
+}
+
+/// Write the current access / refresh tokens into the calendar's
+/// `source_config`. Cheap, and safe to call more than once — the tokens
+/// only change when the provider rotates them.
+fn persist_outlook_tokens(
+    db: &Database,
+    cal_id: i64,
+    config: &mut serde_json::Value,
+    oc: &crate::sources::outlook::OutlookCalendar,
+) {
+    let Some(refresh) = oc.get_refresh_token() else { return };
+    config["refresh_token"] = serde_json::json!(refresh);
+    if let Some(access) = oc.get_access_token_cached() {
+        config["access_token"] = serde_json::json!(access);
+    }
+    let json = serde_json::to_string(config).unwrap_or_default();
+    let _ = db.update_calendar_sync(cal_id, now_secs(), Some(&json));
 }
