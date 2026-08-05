@@ -179,41 +179,31 @@ pub fn short_for_date(
 
 const CACHE_TTL_SECS: i64 = 21600; // 6 hours
 
-/// Fetch forecast with DB caching. Checks weather_cache table first; if the
-/// cached data is less than 6 hours old it is returned directly. Otherwise
-/// a fresh fetch is performed and the result is stored.
-pub fn fetch_cached(
-    lat: f64,
-    lon: f64,
-    db: &Database,
-) -> HashMap<String, DayForecast> {
-    // Try cache first
-    if let Some(cached) = read_cache(db) {
-        return cached;
+/// Whatever the cache holds, plus whether it wants refreshing.
+///
+/// Startup must never wait on the network. A forecast a few hours past
+/// its TTL is still a forecast; a black screen while met.no answers is
+/// not. The caller shows what there is and refreshes behind the UI.
+pub fn cached_or_stale(db: &Database) -> (HashMap<String, DayForecast>, bool) {
+    let Ok(Some((json_str, fetched_at))) = db.get_weather_cache() else {
+        return (HashMap::new(), true);
+    };
+    let stale = crate::database::now_secs() - fetched_at >= CACHE_TTL_SECS;
+    match parse_forecast_json(&json_str) {
+        Some(f) => (f, stale),
+        None => (HashMap::new(), true),
     }
+}
 
+/// Fetch and store, for the background refresh. Returns true if it got
+/// anything worth redrawing for.
+pub fn refresh(lat: f64, lon: f64, db: &Database) -> bool {
     let forecast = fetch_weather(lat, lon);
-
-    // Store in cache
-    if !forecast.is_empty() {
-        write_cache(db, &forecast);
-    }
-
-    forecast
+    if forecast.is_empty() { return false; }
+    write_cache(db, &forecast);
+    true
 }
 
-/// Read forecast from the weather_cache table. Returns None if missing or
-/// expired (older than CACHE_TTL_SECS).
-fn read_cache(db: &Database) -> Option<HashMap<String, DayForecast>> {
-    let (json_str, fetched_at) = db.get_weather_cache().ok()??;
-
-    let now = crate::database::now_secs();
-    if now - fetched_at >= CACHE_TTL_SECS {
-        return None;
-    }
-
-    parse_forecast_json(&json_str)
-}
 
 /// Write forecast data to the weather_cache table.
 fn write_cache(db: &Database, forecast: &HashMap<String, DayForecast>) {

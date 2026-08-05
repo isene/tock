@@ -53,14 +53,31 @@ impl Poller {
         }
     }
 
-    /// Signal the background thread to stop and wait for it to finish.
+    /// Signal the background thread to stop, and give it a moment to
+    /// notice.
+    ///
+    /// Not an unbounded join. The loop syncs before it parks, so quitting
+    /// while a calendar is mid-fetch used to block on the network — five
+    /// and a half seconds of a dead terminal, sometimes more. The flag is
+    /// checked between calendars, so a sync that has started finishes the
+    /// one it is on and stops; if it is stuck in an HTTP call beyond the
+    /// grace period we simply leave it. The process is exiting; the
+    /// thread dies with it, and it holds nothing that a half-written
+    /// sync could corrupt (every upsert is its own transaction).
     pub fn stop(&mut self) {
         let (lock, cvar) = &*self.stopped;
         *lock.lock().unwrap() = true;
         cvar.notify_all();
-        if let Some(handle) = self.thread.take() {
-            let _ = handle.join();
+        let Some(handle) = self.thread.take() else { return };
+        let deadline = std::time::Instant::now() + Duration::from_millis(250);
+        while std::time::Instant::now() < deadline {
+            if handle.is_finished() {
+                let _ = handle.join();
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
         }
+        // Left running on purpose — see above.
     }
 }
 
@@ -82,7 +99,8 @@ fn poller_loop(
     tx: &mpsc::Sender<PollerEvent>,
 ) {
     loop {
-        let any_new = run_sync_cycle(db);
+        let any_new = run_sync_cycle(db, stopped);
+        if *stopped.0.lock().unwrap() { return; }
 
         if any_new {
             let _ = tx.send(PollerEvent::NeedsRefresh);
@@ -111,7 +129,10 @@ fn poller_loop(
 
 /// Run one full sync cycle across all enabled remote calendars.
 /// Returns true if any new events were inserted.
-fn run_sync_cycle(db: &Database) -> bool {
+///
+/// Checks the stop flag between calendars: quitting during a sync should
+/// cost the remainder of one calendar, not of all of them.
+fn run_sync_cycle(db: &Database, stopped: &(Mutex<bool>, Condvar)) -> bool {
     let calendars = match db.get_calendars(true) {
         Ok(c) => c,
         Err(_) => return false,
@@ -125,6 +146,7 @@ fn run_sync_cycle(db: &Database) -> bool {
     let range_end = now + 90 * 86400;
 
     for cal in &calendars {
+        if *stopped.0.lock().unwrap() { break; }
         match cal.source_type.as_str() {
             "google" => {
                 if sync_google_calendar(db, cal, range_start, range_end) {
