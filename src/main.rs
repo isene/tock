@@ -218,6 +218,8 @@ struct App {
     events_by_date: HashMap<(i32, u32, u32), Vec<Event>>,
     weather_forecast: HashMap<String, weather::DayForecast>,
     weather_fetched_at: i64,
+    /// A forecast fetch is already in flight.
+    weather_refreshing: bool,
 
     info: Pane,
     top: Pane,
@@ -291,6 +293,7 @@ impl App {
             events_by_date: HashMap::new(),
             weather_forecast: HashMap::new(),
             weather_fetched_at: 0,
+            weather_refreshing: false,
             info,
             top,
             mid,
@@ -626,6 +629,24 @@ impl App {
     // Data loading
     // =====================================================================
 
+    /// Refresh the forecast on a background thread, then nudge the main
+    /// loop to redraw through the poller's own channel. One at a time —
+    /// a stale cache is read on every range load, and each would
+    /// otherwise start its own fetch.
+    fn refresh_weather_bg(&mut self) {
+        if self.weather_refreshing { return; }
+        self.weather_refreshing = true;
+        let db = self.db.clone();
+        let tx = self._poller_tx.clone();
+        let lat = self.config.get_f64("location.lat", 59.9139);
+        let lon = self.config.get_f64("location.lon", 10.7522);
+        std::thread::spawn(move || {
+            if weather::refresh(lat, lon, &db) {
+                let _ = tx.send(poller::PollerEvent::NeedsRefresh);
+            }
+        });
+    }
+
     fn load_events_for_range(&mut self) {
         let (sy, sm, _) = self.selected_date;
         let range_start = add_months((sy, sm, 1), -3);
@@ -688,13 +709,19 @@ impl App {
             self.selected_event_index = events.len() - 1;
         }
 
-        // Load weather (cached)
+        // Weather, from the cache only. Fetching here put an HTTP round
+        // trip to met.no in front of the first paint every time the
+        // six-hour cache expired — the "black for several seconds" at
+        // startup. Show what the cache has, however old, and refresh
+        // behind the UI.
         let now = database::now_secs();
         if self.weather_forecast.is_empty() || (now - self.weather_fetched_at) > 21600 {
-            let lat = self.config.get_f64("location.lat", 59.9139);
-            let lon = self.config.get_f64("location.lon", 10.7522);
-            self.weather_forecast = weather::fetch_cached(lat, lon, &self.db);
-            self.weather_fetched_at = now;
+            let (cached, stale) = weather::cached_or_stale(&self.db);
+            if !cached.is_empty() {
+                self.weather_forecast = cached;
+                self.weather_fetched_at = now;
+            }
+            if stale { self.refresh_weather_bg(); }
         }
 
         // Invalidate allday cache
