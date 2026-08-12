@@ -1250,7 +1250,16 @@ impl App {
                         let badge = if extra > 0 { format!(" +{}", extra) } else { String::new() };
                         let mut entry = format!("{}{}{}", marker, labeled, badge);
                         if entry.len() > day_col {
-                            entry = format!("{}.", truncate_str(&entry, day_col.saturating_sub(1)));
+                            // Truncate the title, never the badge. Appending
+                            // the badge before truncating dropped it on any
+                            // long title, which is precisely when a slot has
+                            // company: a 14:00 invite sat invisible behind a
+                            // longer-named meeting with nothing on screen to
+                            // say it was there.
+                            let room = day_col
+                                .saturating_sub(marker.len() + badge.len() + 1);
+                            entry = format!("{}{}.{}",
+                                marker, truncate_str(&labeled, room), badge);
                         }
                         if is_at_slot {
                             style::bg(&style::bold(&style::fg(&entry, color)), cell_bg)
