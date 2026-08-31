@@ -132,7 +132,7 @@ checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
 name = "fe2o3-crust"
-version = "0.1.46"
+version = "0.1.47"
 dependencies = [
  "crossterm",
  "libc",
@@ -740,7 +740,7 @@ dependencies = [
 
 [[package]]
 name = "tock"
-version = "0.1.34"
+version = "0.1.35"
 dependencies = [
  "fe2o3-crust",
  "fe2o3-orbit",

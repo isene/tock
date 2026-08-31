@@ -1656,6 +1656,47 @@ impl App {
         }
     }
 
+    /// Push freshly imported events (ICS drop-in or manual import) to their
+    /// remote calendar. An import writes the ICS UID into external_id, which
+    /// made the event look already-synced, so nothing ever sent it on and
+    /// the phone never saw it. Clear that id (kept in metadata as ics_uid),
+    /// then create it remotely; push_event_remote stores the remote id.
+    fn push_imported(&mut self, ids: &[i64]) {
+        let cals = match self.db.get_calendars(false) { Ok(c) => c, Err(_) => return };
+        for &id in ids {
+            let evt = match self.db.get_event(id) { Ok(Some(e)) => e, _ => continue };
+            let cal = match cals.iter().find(|c| c.id == evt.calendar_id) {
+                Some(c) => c.clone(),
+                None => continue,
+            };
+            if cal.source_type == "local" {
+                continue;
+            }
+            let ics_uid = evt.external_id.clone();
+            let data = EventData {
+                id: Some(evt.id),
+                calendar_id: evt.calendar_id,
+                external_id: None,
+                title: evt.title.clone(),
+                description: evt.description.clone(),
+                location: evt.location.clone(),
+                start_time: evt.start_time,
+                end_time: evt.end_time,
+                all_day: evt.all_day,
+                timezone: evt.timezone.clone(),
+                recurrence_rule: evt.recurrence_rule.clone(),
+                series_master_id: evt.series_master_id,
+                status: evt.status.clone(),
+                organizer: evt.organizer.clone(),
+                attendees: evt.attendees.clone(),
+                my_status: evt.my_status.clone(),
+                alarms: evt.alarms.clone(),
+                metadata: ics_uid.map(|u| serde_json::json!({"ics_uid": u})),
+            };
+            self.push_event_remote(&cal, id, data);
+        }
+    }
+
     /// Mirror of push_event_remote for delete: if the calendar is remote
     /// and we have an external id, delete it on the remote side.
     fn delete_event_remote(&mut self, cal: &crate::database::Calendar,
@@ -2524,6 +2565,7 @@ impl App {
 
         let cal_id = self.config.get_i64("default_calendar", 1);
         let result = ics::import_file(p, &self.db, cal_id);
+        self.push_imported(&result.ids);
         self.load_events_for_range();
         self.render_all();
         let mut msg = format!("Imported {} event(s)", result.imported);
@@ -3166,8 +3208,12 @@ impl App {
             // polling, no new syscalls in the no-goto path (goto stat
             // is the gate).
             let cal_id = self.config.get_i64("default_calendar", 1);
-            let imported = ics::watch_incoming(&self.db, cal_id);
-            if imported > 0 { self.load_events_for_range(); }
+            let ids = ics::watch_incoming(&self.db, cal_id);
+            let imported = ids.len();
+            if imported > 0 {
+                self.push_imported(&ids);
+                self.load_events_for_range();
+            }
 
             let content = content.trim().to_string();
             if content.is_empty() {
@@ -3654,8 +3700,9 @@ fn main() {
 
     // Watch incoming ICS files
     let cal_id = app.config.get_i64("default_calendar", 1);
-    let incoming_count = ics::watch_incoming(&app.db, cal_id);
-    if incoming_count > 0 {
+    let incoming_ids = ics::watch_incoming(&app.db, cal_id);
+    if !incoming_ids.is_empty() {
+        app.push_imported(&incoming_ids);
         app.load_events_for_range();
     }
 
