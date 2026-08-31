@@ -32,6 +32,10 @@ pub struct ImportResult {
     pub imported: usize,
     pub skipped: usize,
     pub error: Option<String>,
+    /// Local ids of the master events written, so the caller can push
+    /// them to a remote calendar. Recurrence occurrences are tock-local
+    /// expansions and are not listed; the master carries the rule.
+    pub ids: Vec<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -531,6 +535,7 @@ pub fn import_file(path: &Path, db: &Database, calendar_id: i64) -> ImportResult
                 imported: 0,
                 skipped: 0,
                 error: Some(format!("read error: {}", e)),
+                ids: Vec::new(),
             };
         }
     };
@@ -538,6 +543,7 @@ pub fn import_file(path: &Path, db: &Database, calendar_id: i64) -> ImportResult
     let events = parse(&content);
     let mut imported: usize = 0;
     let mut skipped: usize = 0;
+    let mut ids: Vec<i64> = Vec::new();
 
     for evt in &events {
         // Deduplicate by UID on same calendar.
@@ -608,6 +614,7 @@ pub fn import_file(path: &Path, db: &Database, calendar_id: i64) -> ImportResult
             }
         };
         imported += 1;
+        ids.push(master_id);
 
         // Expand recurring events.
         if let Some(ref rrule) = evt.rrule {
@@ -651,6 +658,7 @@ pub fn import_file(path: &Path, db: &Database, calendar_id: i64) -> ImportResult
         imported,
         skipped,
         error: None,
+        ids,
     }
 }
 
@@ -659,8 +667,9 @@ pub fn import_file(path: &Path, db: &Database, calendar_id: i64) -> ImportResult
 // ---------------------------------------------------------------------------
 
 /// Scan ~/.tock/incoming/*.ics, import each file, move to processed/.
-/// Returns the total number of events imported.
-pub fn watch_incoming(db: &Database, calendar_id: i64) -> usize {
+/// Returns the local ids of the events imported; the caller pushes the
+/// ones on remote calendars (an import alone never leaves this machine).
+pub fn watch_incoming(db: &Database, calendar_id: i64) -> Vec<i64> {
     let incoming = incoming_dir();
     let processed = incoming.join("processed");
 
@@ -668,11 +677,11 @@ pub fn watch_incoming(db: &Database, calendar_id: i64) -> usize {
     let _ = fs::create_dir_all(&incoming);
     let _ = fs::create_dir_all(&processed);
 
-    let mut total_imported: usize = 0;
+    let mut ids: Vec<i64> = Vec::new();
 
     let entries = match fs::read_dir(&incoming) {
         Ok(e) => e,
-        Err(_) => return 0,
+        Err(_) => return ids,
     };
 
     for entry in entries.flatten() {
@@ -704,7 +713,7 @@ pub fn watch_incoming(db: &Database, calendar_id: i64) -> usize {
             .unwrap_or(calendar_id);
 
         let result = import_file(&path, db, target_cal);
-        total_imported += result.imported;
+        ids.extend(result.ids);
 
         // Move to processed directory.
         if let Some(name) = path.file_name() {
@@ -713,7 +722,7 @@ pub fn watch_incoming(db: &Database, calendar_id: i64) -> usize {
         }
     }
 
-    total_imported
+    ids
 }
 
 /// Path to ~/.tock/incoming
