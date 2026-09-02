@@ -239,10 +239,14 @@ fn parse_dt(vevent: &str, field: &str) -> Option<(i64, bool)> {
     }
 
     // 2. FIELD;VALUE=DATE:YYYYMMDD
+    // All-day events are stored at UTC midnight (same as create/edit and
+    // the Google sync). Local midnight would land one offset earlier, so
+    // the UTC date, which the renderer and the Google push both read,
+    // would be the previous day.
     let pat2 = format!(r"(?im)^{};VALUE=DATE:(\d{{8}})", field);
     if let Some(cap) = Regex::new(&pat2).unwrap().captures(vevent) {
         let d = &cap[1];
-        let ts = local_datetime_to_ts(
+        let ts = utc_datetime_to_ts(
             parse_int(&d[0..4]),
             parse_int(&d[4..6]),
             parse_int(&d[6..8]),
@@ -273,11 +277,11 @@ fn parse_dt(vevent: &str, field: &str) -> Option<(i64, bool)> {
         }
     }
 
-    // 4. FIELD:YYYYMMDD (all-day, no time component)
+    // 4. FIELD:YYYYMMDD (all-day, no time component; UTC midnight as above)
     let pat4 = format!(r"(?im)^{}:(\d{{8}})", field);
     if let Some(cap) = Regex::new(&pat4).unwrap().captures(vevent) {
         let d = &cap[1];
-        let ts = local_datetime_to_ts(
+        let ts = utc_datetime_to_ts(
             parse_int(&d[0..4]),
             parse_int(&d[4..6]),
             parse_int(&d[6..8]),
@@ -775,6 +779,8 @@ END:VEVENT";
         assert_eq!(events.len(), 1);
         assert!(events[0].all_day);
         assert_eq!(events[0].title.as_deref(), Some("Holiday"));
+        // UTC midnight, independent of the local timezone.
+        assert_eq!(events[0].start_time, 1735689600);
     }
 
     #[test]
