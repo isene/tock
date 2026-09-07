@@ -1104,6 +1104,12 @@ impl App {
             week_events.push(all.iter().filter(|e| !e.all_day).cloned().collect());
         }
 
+        let week_lanes: Vec<Vec<(usize, usize)>> = (0..7).map(|i| {
+            let day = add_days(week_start, i);
+            let day_start = date_to_ts(day.0, day.1, day.2, 0, 0, 0) - tz;
+            assign_lanes(&week_events[i as usize], day_start)
+        }).collect();
+
         let max_allday = week_allday.iter().map(|v| v.len()).max().unwrap_or(0);
         if max_allday > 0 {
             for row in 0..max_allday {
@@ -1203,101 +1209,97 @@ impl App {
                     hour as u32, minute as u32, 0) - tz;
                 let day_ts_end = day_ts_start + 1800;
 
-                let overlapping: Vec<&Event> = week_events[col as usize].iter()
-                    .filter(|e| e.start_time < day_ts_end && e.end_time > day_ts_start)
+                let day_events = &week_events[col as usize];
+                let day_lanes = &week_lanes[col as usize];
+                let overlapping: Vec<usize> = (0..day_events.len())
+                    .filter(|&i| day_events[i].start_time < day_ts_end
+                        && day_events[i].end_time > day_ts_start)
                     .collect();
-                // At the selected day+slot, draw the event the user has
-                // cycled to so events sharing the slot are each reachable;
-                // elsewhere the first.
-                let evt_opt: Option<&Event> = if is_sel && is_slot_selected {
+                let is_at_slot = is_sel && is_slot_selected;
+                // At the selected day+slot the event the user has cycled
+                // to (e/E) gets the marker and bold; elsewhere nothing does.
+                let sel_in_cell: Option<i64> = if is_at_slot {
                     sel_event_id
-                        .and_then(|id| overlapping.iter().find(|e| e.id == id).copied())
-                        .or_else(|| overlapping.first().copied())
+                        .filter(|id| overlapping.iter().any(|&i| day_events[i].id == *id))
+                        .or_else(|| overlapping.first().map(|&i| day_events[i].id))
                 } else {
-                    overlapping.first().copied()
+                    None
                 };
-                let extra = overlapping.len().saturating_sub(1);
 
-                let cell = if let Some(evt) = evt_opt {
-                    let is_at_slot = is_sel && is_slot_selected;
-                    let marker = if is_at_slot { ">" } else { " " };
-                    let color = evt.calendar_color as u8;
-                    // The title only renders in ONE row per event:
-                    // either the slot where the event starts (so a
-                    // 09:00 event lands on row 09:00), or — when the
-                    // event began before the visible window — at the
-                    // top of the visible scroll so the user always
-                    // sees the name once. Continuation slots show a
-                    // thin left-edge bar in the calendar's colour so
-                    // the span is still obvious without the title
-                    // being printed 13 times.
-                    let starts_here = evt.start_time >= day_ts_start && evt.start_time < day_ts_end;
-                    let is_first_visible = slot_idx == self.slot_offset
-                        && evt.start_time < day_ts_start;
-                    let show_title = starts_here || is_first_visible;
-                    let ends_here = evt.end_time > day_ts_start && evt.end_time <= day_ts_end;
-
-                    if show_title {
-                        let title = if evt.title.is_empty() { "(No title)" } else { &evt.title };
-                        let rsvp = rsvp_marker(evt.my_status.as_deref());
-                        let labeled = if rsvp.is_empty() {
-                            title.to_string()
-                        } else {
-                            format!("{} {}", rsvp, title)
-                        };
-                        // Flag a slot shared by multiple events so the
-                        // hidden ones are discoverable (cycle with e/E).
-                        let badge = if extra > 0 { format!(" +{}", extra) } else { String::new() };
-                        let mut entry = format!("{}{}{}", marker, labeled, badge);
-                        if entry.len() > day_col {
-                            // Truncate the title, never the badge. Appending
-                            // the badge before truncating dropped it on any
-                            // long title, which is precisely when a slot has
-                            // company: a 14:00 invite sat invisible behind a
-                            // longer-named meeting with nothing on screen to
-                            // say it was there.
-                            let room = day_col
-                                .saturating_sub(marker.len() + badge.len() + 1);
-                            entry = format!("{}{}.{}",
-                                marker, truncate_str(&labeled, room), badge);
-                        }
-                        if is_at_slot {
-                            style::bg(&style::bold(&style::fg(&entry, color)), cell_bg)
-                        } else {
-                            style::bg(&style::fg(&entry, color), cell_bg)
-                        }
-                    } else {
-                        // Continuation row. `▕` (U+2595 RIGHT ONE
-                        // EIGHTH BLOCK) draws a single thin bar on
-                        // the left edge in the event's colour; the
-                        // rest of the cell stays on the slot bg so
-                        // it reads as quiet continuation rather than
-                        // a heavy block. The last slot of a multi-
-                        // slot event additionally prints the end
-                        // time (e.g. "▕ -15:30") so the GM knows
-                        // exactly where it stops without scrolling.
-                        let bar = if is_at_slot {
-                            style::bold(&style::fg("\u{2595}", color))
-                        } else {
-                            style::fg("\u{2595}", color)
-                        };
-                        let tail = if ends_here {
-                            let end_local = evt.end_time + tz;
-                            let hh = ((end_local.rem_euclid(86400)) / 3600) as i32;
-                            let mm = ((end_local.rem_euclid(3600)) / 60) as i32;
-                            format!(" -{:02}:{:02}", hh, mm)
-                        } else {
-                            String::new()
-                        };
-                        let tail_styled = if tail.is_empty() {
-                            String::new()
-                        } else {
-                            style::fg(&tail, color)
-                        };
-                        style::bg(&format!("{}{}", bar, tail_styled), cell_bg)
-                    }
+                let cell = if overlapping.is_empty() {
+                    style::bg(&" ".repeat(day_col), cell_bg)
                 } else {
-                    style::bg(" ", cell_bg)
+                    // Events that share cells sit side by side in lanes,
+                    // so a 10:50 appointment shows next to the 10:00
+                    // meeting instead of hidden behind it.
+                    let n_lanes = day_lanes[overlapping[0]].1;
+                    let lane_w = day_col / n_lanes;
+                    let mut cell = String::new();
+                    for lane in 0..n_lanes {
+                        let w = if lane + 1 == n_lanes { day_col - lane_w * lane } else { lane_w };
+                        let found = overlapping.iter()
+                            .find(|&&i| day_lanes[i].0 == lane)
+                            .map(|&i| &day_events[i]);
+                        let Some(evt) = found else {
+                            cell.push_str(&style::bg(&" ".repeat(w), cell_bg));
+                            continue;
+                        };
+                        let is_sel_evt = sel_in_cell == Some(evt.id);
+                        let color = evt.calendar_color as u8;
+                        // The title only renders in ONE row per event:
+                        // either the slot where the event starts (so a
+                        // 09:00 event lands on row 09:00), or, when the
+                        // event began before the visible window, at the
+                        // top of the visible scroll so the user always
+                        // sees the name once. Continuation slots show a
+                        // thin left-edge bar in the calendar's colour so
+                        // the span is still obvious without the title
+                        // being printed 13 times.
+                        let starts_here = evt.start_time >= day_ts_start && evt.start_time < day_ts_end;
+                        let is_first_visible = slot_idx == self.slot_offset
+                            && evt.start_time < day_ts_start;
+                        let show_title = starts_here || is_first_visible;
+                        let ends_here = evt.end_time > day_ts_start && evt.end_time <= day_ts_end;
+
+                        let text = if show_title {
+                            let title = if evt.title.is_empty() { "(No title)" } else { &evt.title };
+                            let rsvp = rsvp_marker(evt.my_status.as_deref());
+                            let labeled = if rsvp.is_empty() {
+                                title.to_string()
+                            } else {
+                                format!("{} {}", rsvp, title)
+                            };
+                            let marker = if is_sel_evt { ">" } else { " " };
+                            if labeled.chars().count() + 1 > w {
+                                format!("{}{}.", marker, truncate_str(&labeled, w.saturating_sub(2)))
+                            } else {
+                                format!("{}{}", marker, labeled)
+                            }
+                        } else {
+                            // Continuation row. `▕` (U+2595 RIGHT ONE
+                            // EIGHTH BLOCK) draws a single thin bar on
+                            // the left edge in the event's colour. The
+                            // last slot of a multi-slot event adds the
+                            // end time (e.g. "▕ -15:30").
+                            let tail = if ends_here {
+                                let end_local = evt.end_time + tz;
+                                let hh = ((end_local.rem_euclid(86400)) / 3600) as i32;
+                                let mm = ((end_local.rem_euclid(3600)) / 60) as i32;
+                                format!(" -{:02}:{:02}", hh, mm)
+                            } else {
+                                String::new()
+                            };
+                            truncate_str(&format!("\u{2595}{}", tail), w)
+                        };
+                        let styled = if is_sel_evt {
+                            style::bold(&style::fg(&text, color))
+                        } else {
+                            style::fg(&text, color)
+                        };
+                        let pad = w.saturating_sub(display_width(&text));
+                        cell.push_str(&style::bg(&format!("{}{}", styled, " ".repeat(pad)), cell_bg));
+                    }
+                    cell
                 };
 
                 let pure_len = display_width(&cell);
@@ -3250,6 +3252,45 @@ fn day_diff(a: (i32, u32, u32), b: (i32, u32, u32)) -> i64 {
     ((ts_a - ts_b) / 86400).abs()
 }
 
+/// Side-by-side lanes for events that share half-hour cells. Returns
+/// `(lane, lanes)` per event: the column it draws in and how many
+/// columns its overlap group is split into. An event with no company
+/// gets `(0, 1)`, the full cell width. Overlap is measured on the
+/// half-hour grid the week view draws, not on the raw times: a 10:00
+/// to 10:45 meeting and a 10:50 appointment share the 10:30 cell.
+fn assign_lanes(events: &[Event], day_start: i64) -> Vec<(usize, usize)> {
+    let slot = |ts: i64| (ts - day_start).div_euclid(1800);
+    let mut order: Vec<usize> = (0..events.len()).collect();
+    // Earliest first; on a tie the longest, so it takes the left lane.
+    order.sort_by_key(|&i| (events[i].start_time, -events[i].end_time));
+    let mut out = vec![(0usize, 1usize); events.len()];
+    let mut lane_free: Vec<i64> = Vec::new(); // per lane: first free slot
+    let mut group: Vec<usize> = Vec::new();
+    let mut group_end = i64::MIN;
+    for &i in &order {
+        let s = slot(events[i].start_time);
+        let e = slot(events[i].end_time - 1) + 1;
+        if s >= group_end {
+            let lanes = lane_free.len().max(1);
+            for &g in &group { out[g].1 = lanes; }
+            group.clear();
+            lane_free.clear();
+            group_end = i64::MIN;
+        }
+        let lane = match lane_free.iter().position(|&free| free <= s) {
+            Some(l) => l,
+            None => { lane_free.push(0); lane_free.len() - 1 }
+        };
+        lane_free[lane] = e;
+        out[i].0 = lane;
+        group.push(i);
+        group_end = group_end.max(e);
+    }
+    let lanes = lane_free.len().max(1);
+    for &g in &group { out[g].1 = lanes; }
+    out
+}
+
 fn truncate_str(s: &str, max: usize) -> String {
     if s.len() <= max { s.to_string() }
     else { s.chars().take(max).collect() }
@@ -3764,6 +3805,35 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ev(id: i64, start: i64, end: i64) -> Event {
+        Event {
+            id, calendar_id: 1, external_id: None, title: String::new(),
+            description: None, location: None, start_time: start, end_time: end,
+            all_day: false, timezone: None, recurrence_rule: None,
+            series_master_id: None, status: String::new(), organizer: None,
+            attendees: None, my_status: None, alarms: None, metadata: None,
+            calendar_name: String::new(), calendar_color: 0,
+        }
+    }
+
+    #[test]
+    fn lanes_split_events_that_share_a_half_hour_cell() {
+        let h = |hh: i64, mm: i64| hh * 3600 + mm * 60;
+        // 10:00-10:45 and 10:50-11:50 never overlap in time but share
+        // the 10:30 cell; 11:30-12:00 shares 11:30 with the second and
+        // takes lane 0 back once the first has ended.
+        let events = vec![ev(1, h(10, 0), h(10, 45)), ev(2, h(10, 50), h(11, 50)), ev(3, h(11, 30), h(12, 0))];
+        assert_eq!(assign_lanes(&events, 0), vec![(0, 2), (1, 2), (0, 2)]);
+        // A lone event keeps the full width; an event ending exactly on
+        // the half hour frees that cell for the next.
+        let events = vec![ev(1, h(9, 0), h(10, 0)), ev(2, h(10, 0), h(11, 0)), ev(3, h(14, 0), h(15, 0))];
+        assert_eq!(assign_lanes(&events, 0), vec![(0, 1), (0, 1), (0, 1)]);
+        // Three at once: three lanes for the whole group, longest on
+        // the left; the afternoon event is on its own.
+        let events = vec![ev(1, h(9, 0), h(12, 0)), ev(2, h(9, 0), h(10, 0)), ev(3, h(9, 0), h(9, 30)), ev(4, h(13, 0), h(14, 0))];
+        assert_eq!(assign_lanes(&events, 0), vec![(0, 3), (1, 3), (2, 3), (0, 1)]);
+    }
 
     #[test]
     fn extract_modern_teams_meet() {

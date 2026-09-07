@@ -13,7 +13,7 @@ Terminal calendar with week view, event management, astronomy, and weather. Buil
 ## Features
 
 - **5-pane TUI**: info bar, mini-month strip, week view grid, event details, status bar
-- **Week view**: 7-column layout with half-hour time slots, all-day event rows, weather per day
+- **Week view**: 7-column layout with half-hour time slots, all-day event rows, weather per day; events that overlap sit side by side in lanes
 - **Mini-month calendars**: horizontal strip with event indicators, week numbers, today highlight
 - **Calendar sources**: Google Calendar (OAuth2), Outlook/365 (device auth), local events
 - **ICS import**: parse and import .ics files with RRULE expansion for recurring events
