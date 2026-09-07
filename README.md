@@ -79,6 +79,36 @@ Config file: `~/.tock/config.yml`
 
 Settings include location (for astronomy/weather), work hours, calendar colors, sync intervals, and notification preferences.
 
+## Google Calendar
+
+Syncing works. The `G` key does not set it up yet: it asks for the email
+and then points at documentation, so the three steps below are manual.
+
+1. Get an OAuth client from Google Cloud (Desktop type), with the
+   Calendar API enabled. Save the JSON as `<email>.json` in
+   `~/.config/tock/credentials` (set by `google.safe_dir`).
+
+2. Mint a refresh token for the scope
+   `https://www.googleapis.com/auth/calendar` with any standard OAuth
+   loopback flow. Save the raw token as `<email>.calendar.txt` next to
+   the JSON. No helper ships with tock yet.
+
+3. Add the calendar to the database:
+
+```sh
+sqlite3 ~/.tock/tock.db "INSERT INTO calendars \
+  (name, source_type, source_config, color, enabled, created_at) \
+  VALUES ('Google', 'google', \
+  json_object('email','<email>','google_calendar_id','<email>'), \
+  39, 1, strftime('%s','now'));"
+```
+
+`google_calendar_id` is your email for the primary calendar, or the
+calendar ID for any other one. Press `S` in tock to sync, or wait for
+the poller (`google.sync_interval`, 300 s).
+
+Outlook needs none of this: `O` runs the whole device-code flow.
+
 ## Dependencies
 
 Runtime: SQLite (bundled). Optional: `notify-send` (notifications), `xclip` (clipboard).
