@@ -16,6 +16,20 @@ use crate::notifications;
 
 pub enum PollerEvent {
     NeedsRefresh,
+    /// After every cycle: the first calendar that could not sync, in
+    /// plain words, or None when all went well.
+    SyncStatus(Option<String>),
+}
+
+/// One line for a calendar that could not sync. A provider answer that
+/// says the sign-in has run out becomes the key to press.
+pub fn sync_failure(kind: &str, name: &str, err: &str) -> String {
+    let key = if kind == "Outlook" { "O" } else { "G" };
+    if err.contains("invalid_grant") || err.contains("AADSTS") {
+        format!("{} {}: sign-in expired, press {} to sign in again", kind, name, key)
+    } else {
+        format!("{} {}: {}", kind, name, err)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -99,12 +113,13 @@ fn poller_loop(
     tx: &mpsc::Sender<PollerEvent>,
 ) {
     loop {
-        let any_new = run_sync_cycle(db, stopped);
+        let (any_new, failure) = run_sync_cycle(db, stopped);
         if *stopped.0.lock().unwrap() { return; }
 
         if any_new {
             let _ = tx.send(PollerEvent::NeedsRefresh);
         }
+        let _ = tx.send(PollerEvent::SyncStatus(failure));
 
         notifications::check_and_notify(db, default_alarm);
 
@@ -128,17 +143,19 @@ fn poller_loop(
 // ---------------------------------------------------------------------------
 
 /// Run one full sync cycle across all enabled remote calendars.
-/// Returns true if any new events were inserted.
+/// Returns whether any new events were inserted, and the first calendar
+/// that failed, so the screen can say so instead of staying quiet.
 ///
 /// Checks the stop flag between calendars: quitting during a sync should
 /// cost the remainder of one calendar, not of all of them.
-fn run_sync_cycle(db: &Database, stopped: &(Mutex<bool>, Condvar)) -> bool {
+fn run_sync_cycle(db: &Database, stopped: &(Mutex<bool>, Condvar)) -> (bool, Option<String>) {
     let calendars = match db.get_calendars(true) {
         Ok(c) => c,
-        Err(_) => return false,
+        Err(_) => return (false, None),
     };
 
     let mut any_new = false;
+    let mut failure: Option<String> = None;
 
     // 90-day window around today.
     let now = now_secs();
@@ -147,23 +164,20 @@ fn run_sync_cycle(db: &Database, stopped: &(Mutex<bool>, Condvar)) -> bool {
 
     for cal in &calendars {
         if *stopped.0.lock().unwrap() { break; }
-        match cal.source_type.as_str() {
-            "google" => {
-                if sync_google_calendar(db, cal, range_start, range_end) {
-                    any_new = true;
-                }
-            }
-            "outlook" => {
-                if sync_outlook_calendar(db, cal, range_start, range_end) {
-                    any_new = true;
-                }
-            }
+        let result = match cal.source_type.as_str() {
+            "google" => sync_google_calendar(db, cal, range_start, range_end),
+            "outlook" => sync_outlook_calendar(db, cal, range_start, range_end),
             // "local" and other types: nothing to sync remotely.
-            _ => {}
+            _ => Ok(false),
+        };
+        match result {
+            Ok(true) => any_new = true,
+            Ok(false) => {}
+            Err(e) => { if failure.is_none() { failure = Some(e); } }
         }
     }
 
-    any_new
+    (any_new, failure)
 }
 
 // ---------------------------------------------------------------------------
@@ -175,31 +189,31 @@ fn sync_google_calendar(
     cal: &crate::database::Calendar,
     range_start: i64,
     range_end: i64,
-) -> bool {
+) -> Result<bool, String> {
     use crate::sources::google::GoogleCalendar;
 
     let cfg_str = match &cal.source_config {
         Some(s) => s.clone(),
-        None => return false,
+        None => return Ok(false),
     };
     let config: serde_json::Value = match serde_json::from_str(&cfg_str) {
         Ok(v) => v,
-        Err(_) => return false,
+        Err(_) => return Ok(false),
     };
 
     let email = match config.get("email").and_then(|v| v.as_str()) {
         Some(e) => e,
-        None => return false,
+        None => return Ok(false),
     };
     let safe_dir = config.get("safe_dir").and_then(|v| v.as_str());
     let google_calendar_id = match config.get("google_calendar_id").and_then(|v| v.as_str()) {
         Some(id) => id,
-        None => return false,
+        None => return Ok(false),
     };
 
     let mut gc = GoogleCalendar::new(email, safe_dir);
     if gc.get_access_token().is_none() {
-        return false;
+        return Err(sync_failure("Google", &cal.name, gc.last_error.as_deref().unwrap_or("sign-in failed")));
     }
 
     let time_min = ts_to_rfc3339(range_start);
@@ -208,7 +222,7 @@ fn sync_google_calendar(
     let (events, cancelled) =
         match gc.fetch_events_with_cancellations(google_calendar_id, &time_min, &time_max) {
             Some(pair) => pair,
-            None => return false,
+            None => return Err(sync_failure("Google", &cal.name, gc.last_error.as_deref().unwrap_or("fetch failed"))),
         };
 
     let mut any_new = false;
@@ -233,7 +247,7 @@ fn sync_google_calendar(
     }
 
     let _ = db.update_calendar_sync(cal.id, now_secs(), None);
-    any_new
+    Ok(any_new)
 }
 
 fn ts_to_rfc3339(ts: i64) -> String {
@@ -264,21 +278,21 @@ fn sync_outlook_calendar(
     cal: &crate::database::Calendar,
     range_start: i64,
     range_end: i64,
-) -> bool {
+) -> Result<bool, String> {
     use crate::sources::outlook::OutlookCalendar;
 
     let cfg_str = match &cal.source_config {
         Some(s) => s.clone(),
-        None => return false,
+        None => return Ok(false),
     };
     let mut config: serde_json::Value = match serde_json::from_str(&cfg_str) {
         Ok(v) => v,
-        Err(_) => return false,
+        Err(_) => return Ok(false),
     };
 
     let mut oc = OutlookCalendar::new(&config);
     if oc.refresh_access_token().is_none() {
-        return false;
+        return Err(sync_failure("Outlook", &cal.name, oc.last_error.as_deref().unwrap_or("sign-in failed")));
     }
 
     // Persist the rotated tokens NOW, not after the fetch. Microsoft
@@ -293,7 +307,7 @@ fn sync_outlook_calendar(
 
     let events = match oc.fetch_events(&time_min, &time_max) {
         Some(evts) => evts,
-        None => return false,
+        None => return Err(sync_failure("Outlook", &cal.name, oc.last_error.as_deref().unwrap_or("fetch failed"))),
     };
 
     let mut any_new = false;
@@ -308,7 +322,7 @@ fn sync_outlook_calendar(
 
     // Stamp the sync time; the tokens went in before the fetch.
     let _ = db.update_calendar_sync(cal.id, now_secs(), None);
-    any_new
+    Ok(any_new)
 }
 
 /// Write the current access / refresh tokens into the calendar's

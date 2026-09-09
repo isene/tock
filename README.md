@@ -107,7 +107,10 @@ sqlite3 ~/.tock/tock.db "INSERT INTO calendars \
 calendar ID for any other one. Press `S` in tock to sync, or wait for
 the poller (`google.sync_interval`, 300 s).
 
-Outlook needs none of this: `O` runs the whole device-code flow.
+Outlook needs none of this: `O` runs the whole device-code flow. A company
+sign-in policy can expire that sign-in after some weeks; tock then shows a red
+⚠ line in the status bar and `S` says which calendar it is. Press `O` and sign
+in again; the calendar and its events stay as they are.
 
 ## Dependencies
 

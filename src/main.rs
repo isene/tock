@@ -236,6 +236,9 @@ struct App {
     allday_count: usize,
 
     syncing: bool,
+    /// The calendar that could not sync last time, shown in the status
+    /// bar until a sync succeeds again.
+    sync_warning: Option<String>,
     poller_rx: mpsc::Receiver<poller::PollerEvent>,
     _poller_tx: mpsc::Sender<poller::PollerEvent>,
 }
@@ -306,6 +309,7 @@ impl App {
             allday_count_date: None,
             allday_count: 0,
             syncing: false,
+            sync_warning: None,
             poller_rx: rx,
             _poller_tx: tx,
         }
@@ -849,18 +853,19 @@ impl App {
         let keys = "d/D:Day  w/W:Week  m/M:Month  y/Y:Year  e/E:Event  n:New  g:GoTo  t:Today  i:Import  G:Google  O:Outlook  S:Sync  C:Cal  P:Prefs  ?:Help  q:Quit";
         let version = format!("tock v{}", env!("CARGO_PKG_VERSION"));
         let w = self.cols as usize;
-        if self.syncing {
-            let sync_ind = style::fg(" Syncing...", 226);
-            let used = keys.len() + 12 + version.len() + 2;
-            let pad_len = w.saturating_sub(used).max(1);
-            let text = format!(" {}{}{} {}", keys, " ".repeat(pad_len), sync_ind, version);
-            self.status.set_text(&text);
+        // Right of the keys: the sync in progress, else a calendar that
+        // could not sync, else nothing.
+        let right = if self.syncing {
+            style::fg(" Syncing...", 226)
+        } else if let Some(warn) = &self.sync_warning {
+            style::fg(&format!(" \u{26a0} {}", warn), 196)
         } else {
-            let used = keys.len() + version.len() + 3;
-            let pad_len = w.saturating_sub(used).max(1);
-            let text = format!(" {}{}{}", keys, " ".repeat(pad_len), version);
-            self.status.set_text(&text);
-        }
+            String::new()
+        };
+        let used = keys.len() + crust::display_width(&right) + version.len() + 3;
+        let pad_len = w.saturating_sub(used).max(1);
+        let text = format!(" {}{}{} {}", keys, " ".repeat(pad_len), right, version);
+        self.status.set_text(&text);
         self.status.refresh();
     }
 
@@ -2720,6 +2725,7 @@ impl App {
         let range_start = now - 90 * 86400;
         let range_end = now + 90 * 86400;
         let mut any_new = false;
+        let mut failed: Vec<String> = Vec::new();
 
         for cal in &google_cals {
             let cfg_str = match &cal.source_config { Some(s) => s.clone(), None => continue };
@@ -2732,8 +2738,8 @@ impl App {
             let gcid = config.get("google_calendar_id").and_then(|v| v.as_str()).unwrap_or("");
             let mut gc = crate::sources::google::GoogleCalendar::new(email, safe_dir);
             if gc.get_access_token().is_none() {
-                let err = gc.last_error.as_deref().unwrap_or("auth failed");
-                self.show_feedback(&format!("Google sync {}: {}", cal.name, err), 196);
+                let err = gc.last_error.as_deref().unwrap_or("sign-in failed");
+                failed.push(poller::sync_failure("Google", &cal.name, err));
                 continue;
             }
             let tmin = crate::sources::google::ts_to_rfc3339_pub(range_start);
@@ -2748,6 +2754,8 @@ impl App {
                     }
                 }
                 let _ = self.db.update_calendar_sync(cal.id, now, None);
+            } else {
+                failed.push(poller::sync_failure("Google", &cal.name, gc.last_error.as_deref().unwrap_or("fetch failed")));
             }
         }
 
@@ -2759,8 +2767,8 @@ impl App {
             };
             let mut oc = crate::sources::outlook::OutlookCalendar::new(&config);
             if oc.refresh_access_token().is_none() {
-                let err = oc.last_error.as_deref().unwrap_or("auth failed");
-                self.show_feedback(&format!("Outlook sync {}: {}", cal.name, err), 196);
+                let err = oc.last_error.as_deref().unwrap_or("sign-in failed");
+                failed.push(poller::sync_failure("Outlook", &cal.name, err));
                 continue;
             }
             let tmin = crate::sources::google::ts_to_rfc3339_pub(range_start);
@@ -2782,16 +2790,25 @@ impl App {
                     Some(serde_json::to_string(&config).unwrap_or_default())
                 } else { None };
                 let _ = self.db.update_calendar_sync(cal.id, now, new_cfg.as_deref());
+            } else {
+                failed.push(poller::sync_failure("Outlook", &cal.name, oc.last_error.as_deref().unwrap_or("fetch failed")));
             }
         }
 
         self.syncing = false;
+        self.sync_warning = failed.first().cloned();
         if any_new {
             self.load_events_for_range();
             self.render_all();
-            self.show_feedback("Sync complete, new events loaded", 156);
         } else {
             self.render_status_bar();
+        }
+        // A calendar that failed is the news; "complete" would hide it.
+        if !failed.is_empty() {
+            self.show_feedback(&failed.join(" \u{00b7} "), 196);
+        } else if any_new {
+            self.show_feedback("Sync complete, new events loaded", 156);
+        } else {
             self.show_feedback("Sync complete, no changes", 245);
         }
     }
@@ -3769,9 +3786,20 @@ fn main() {
             app.handle_input(k);
         } else {
             // Idle: check poller
-            if let Ok(poller::PollerEvent::NeedsRefresh) = app.poller_rx.try_recv() {
-                app.load_events_for_range();
-                app.render_all();
+            while let Ok(ev) = app.poller_rx.try_recv() {
+                match ev {
+                    poller::PollerEvent::NeedsRefresh => {
+                        app.load_events_for_range();
+                        app.render_all();
+                    }
+                    poller::PollerEvent::SyncStatus(warning) => {
+                        if app.sync_warning != warning {
+                            app.sync_warning = warning;
+                            app.render_status_bar();
+                            if let Some(w) = app.sync_warning.clone() { app.show_feedback(&w, 196); }
+                        }
+                    }
+                }
             }
 
             // Check notifications only when the wall-clock minute changes.
