@@ -276,6 +276,18 @@ impl OutlookCalendar {
                     None
                 }
             }
+            Err(ureq::Error::Status(code, resp)) => {
+                // Microsoft says why in the body. Keep `error` and the first
+                // sentence of its description, so an expired sign-in reaches
+                // the screen as "press O" instead of a bare 400.
+                let body = resp.into_string().unwrap_or_default();
+                let why = serde_json::from_str::<Value>(&body).ok().map(|j| format!("{}: {}",
+                    j.get("error").and_then(Value::as_str).unwrap_or(""),
+                    j.get("error_description").and_then(Value::as_str).unwrap_or("")
+                        .split('.').next().unwrap_or("").trim())).unwrap_or_default();
+                self.last_error = Some(format!("refresh failed ({}) {}", code, why));
+                None
+            }
             Err(e) => {
                 self.last_error = Some(format!("Refresh request failed: {}", e));
                 None
