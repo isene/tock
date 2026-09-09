@@ -64,7 +64,7 @@ cp target/release/tock ~/.local/bin/
 | Ctrl+Y | Copy event to clipboard |
 | i | Import ICS file |
 | G | Setup Google Calendar |
-| O | Setup Outlook/365 |
+| O | Sign in to Outlook/365: opens the sign-in page in your browser with the code on the clipboard |
 | S | Manual sync |
 | C | Calendar manager |
 | P | Preferences |
