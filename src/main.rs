@@ -2656,10 +2656,19 @@ impl App {
             .unwrap_or("https://microsoft.com/devicelogin").to_string();
         let device_code = dev.get("device_code").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-        // Show the code + URL, then block on the poll. The bottom line
-        // stays put while the UI is frozen during sign-in.
+        // Hand the page to the browser and the code to the clipboard, so
+        // signing in is: switch window, paste, confirm. Then block on the
+        // poll; the bottom line stays put while the UI waits.
+        crust::clipboard_copy(&user_code, "clipboard");
+        crust::clipboard_copy(&user_code, "primary");
+        let _ = std::process::Command::new("xdg-open").arg(&uri)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
         self.blank_bottom(&style::bold(&style::fg(
-            &format!(" Open {}  —  enter code  {}   (signing in… UI waits)", uri, user_code), 46)));
+            &format!(" Browser opened {} \u{00b7} code {} is on your clipboard, paste it there   (signing in\u{2026} UI waits)",
+                uri, user_code), 46)));
 
         let tok = match oc.poll_for_token(&device_code) {
             Some(t) => t,
