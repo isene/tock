@@ -3179,7 +3179,7 @@ impl App {
         lines.push(format!("  {}", style::fg("Press any key to close...", 245)));
 
         popup.set_text(&lines.join("\n"));
-        popup.refresh();
+        popup.full_refresh(); // draws the border; refresh() alone does not
         let _ = Input::getchr(None);
         Crust::clear_screen();
         self.recreate_panes();
