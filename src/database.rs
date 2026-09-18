@@ -1074,3 +1074,37 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod startup {
+    //! How long opening takes, on copies of this machine's own files.
+    //! Run by hand with `cargo test --release startup -- --ignored --nocapture`.
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn how_long_an_open_takes() {
+        let home = std::env::var("HOME").unwrap();
+        let real = PathBuf::from(home).join(".tock");
+        if !real.join("tock.db").exists() || !real.join("tock.ferrite").exists() { return; }
+        let dir = std::env::temp_dir().join(format!("tock-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("tock.ferrite")).unwrap();
+        std::fs::copy(real.join("tock.db"), dir.join("tock.db")).unwrap();
+        for f in ["log", "snapshot"] {
+            let _ = std::fs::copy(real.join("tock.ferrite").join(f), dir.join("tock.ferrite").join(f));
+        }
+        for engine in ["sqlite", "ferrite"] {
+            let mut times = Vec::new();
+            for _ in 0..5 {
+                let t0 = std::time::Instant::now();
+                let db = Database::open(&dir.join("tock.db"), engine).unwrap();
+                let n = db.get_events_in_range(0, i64::MAX).unwrap().len();
+                times.push((t0.elapsed().as_secs_f64() * 1e3, n));
+            }
+            times.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            eprintln!("{engine}: open and read every event, median of 5: {:.1} ms ({} events)", times[2].0, times[2].1);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
