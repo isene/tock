@@ -60,6 +60,10 @@ colors:
   info_bg: 235
   status_bg: 235
 default_calendar: 1
+# Which engine keeps the calendars: sqlite (the default) or ferrite, the
+# Fe2O3 database that keeps its tables in memory. Switching to ferrite
+# copies tock.db once and leaves it alone after that.
+database: sqlite
 # Meeting launchers for the `J` (Join) key. Keys are host suffixes
 # matched against the meeting URL (so `us02web.zoom.us` resolves
 # under a `zoom.us` entry). Empty values force the xdg-open path.
