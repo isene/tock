@@ -39,6 +39,12 @@ jobs:
           repository: isene/crust
           path: crust
 
+      - name: Checkout ferrite
+        uses: actions/checkout@v4
+        with:
+          repository: isene/ferrite
+          path: ferrite
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
