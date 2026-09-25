@@ -2682,7 +2682,7 @@ impl App {
             .filter(|cfg| cfg.get("email").and_then(|v| v.as_str()) == Some(email.as_str()))
             .filter_map(|cfg| cfg.get("google_calendar_id").and_then(|v| v.as_str()).map(String::from))
             .collect();
-        let mut added = 0;
+        let (mut added, mut on) = (0, 0);
         for c in cals.iter().filter(|c| !have.contains(&c.id)) {
             let colour = c.color.as_deref().and_then(style::parse_hex_color)
                 .map(|(r, g, b)| style::rgb_to_xterm(r, g, b) as i64)
@@ -2690,6 +2690,7 @@ impl App {
             let cfg = serde_json::json!({ "email": email, "google_calendar_id": c.id, "safe_dir": safe_dir });
             if self.db.add_calendar(&c.summary, "google", &cfg.to_string(), colour, c.primary).is_ok() {
                 added += 1;
+                on += c.primary as usize;
             }
         }
         if added > 0 {
@@ -2700,7 +2701,7 @@ impl App {
             self.show_feedback(&format!("Signed in to Google again as {email}. Press S to sync."), 46);
         } else {
             self.show_feedback(&format!(
-                "Google: {added} calendar(s) added and synced, the main one on; C turns on the others."), 46);
+                "Google: {added} calendar(s) added, {on} of them on and synced; C turns on the others."), 46);
         }
     }
 
