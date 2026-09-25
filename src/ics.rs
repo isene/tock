@@ -71,7 +71,7 @@ fn unfold(text: &str) -> String {
 /// Parse a single VEVENT block into an IcsEvent.
 fn parse_vevent(vevent: &str) -> Option<IcsEvent> {
     // SUMMARY
-    let title = extract_field(vevent, "SUMMARY");
+    let title = extract_field(vevent, "SUMMARY").map(|t| unescape(&t));
 
     // DTSTART
     let (start_time, all_day) = parse_dt(vevent, "DTSTART")?;
@@ -89,7 +89,7 @@ fn parse_vevent(vevent: &str) -> Option<IcsEvent> {
     };
 
     // LOCATION
-    let location = extract_field(vevent, "LOCATION");
+    let location = extract_field(vevent, "LOCATION").map(|l| unescape(&l));
 
     // DESCRIPTION (may span multiple logical lines after unfolding)
     let description = extract_description(vevent);
@@ -153,16 +153,31 @@ fn extract_field(vevent: &str, field: &str) -> Option<String> {
 /// the first colon, then unescape ICS sequences.
 fn extract_description(vevent: &str) -> Option<String> {
     let raw = extract_field(vevent, "DESCRIPTION")?;
-    let desc = raw
-        .replace("\\n", "\n")
-        .replace("\\,", ",")
-        .replace("\\;", ";");
-    let desc = desc.trim().to_string();
+    let desc = unescape(&raw).trim().to_string();
     if desc.is_empty() {
         None
     } else {
         Some(desc)
     }
+}
+
+/// Undo iCalendar's text escapes (RFC 5545 3.3.11): `\n`, `\,`, `\;`
+/// and `\\`, in one pass so an escaped backslash stays one.
+fn unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') | Some('N') => out.push('\n'),
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 /// Extract ORGANIZER: prefer CN= parameter, fall back to MAILTO:.

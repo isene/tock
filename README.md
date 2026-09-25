@@ -15,7 +15,7 @@ Terminal calendar with week view, event management, astronomy, and weather. Buil
 - **5-pane TUI**: info bar, mini-month strip, week view grid, event details, status bar
 - **Week view**: 7-column layout with half-hour time slots, all-day event rows, weather per day; events that overlap sit side by side in lanes
 - **Mini-month calendars**: horizontal strip with event indicators, week numbers, today highlight
-- **Calendar sources**: Google Calendar (OAuth2), Outlook/365 (device auth), local events
+- **Calendar sources**: Google Calendar (OAuth2), Outlook/365 (device auth), CalDAV (iCloud, Fastmail, Nextcloud, Radicale), local events
 - **ICS import**: parse and import .ics files with RRULE expansion for recurring events
 - **Background sync**: automatic polling with configurable intervals
 - **Ephemeris engine**: full planetary position calculator ported from [ruby-ephemeris](https://github.com/isene/ephemeris)
@@ -64,6 +64,7 @@ cp target/release/tock ~/.local/bin/
 | Ctrl+Y | Copy event to clipboard |
 | i | Import ICS file |
 | G | Setup Google Calendar |
+| K | Setup CalDAV (iCloud, Fastmail, Nextcloud, …) |
 | O | Sign in to Outlook/365: opens the sign-in page in your browser with the code on the clipboard |
 | S | Manual sync |
 | C | Calendar manager |
@@ -111,6 +112,30 @@ the code.
 A client still in "Testing" gets a sign-in that lapses after a week. Press
 `G` again with the same email: tock signs in anew and leaves the calendars
 as they are. Publishing the consent screen ends the weekly sign-in.
+
+## CalDAV: iCloud, Fastmail, Nextcloud and more
+
+Press `K` and give the server, your user name and a password:
+
+| Service | Server | User name | Password |
+|---|---|---|---|
+| iCloud | `https://caldav.icloud.com` | your Apple ID | an app-specific password from account.apple.com |
+| Fastmail | `https://caldav.fastmail.com` | your address | an app password |
+| Nextcloud | `https://<your server>/remote.php/dav` | your user | your password or an app password |
+| Radicale | `http://<host>:5232` | your user | your password |
+
+tock finds the account's calendars and adds every one that takes events,
+all on; `C` turns any off. A task list is left out. The password is kept in
+a file only you can read, beside the Google credentials.
+
+Events come down with the rest of the sync. tock first asks the server
+whether a calendar changed at all, and fetches its events only when it has,
+or once a day. A repeating event arrives as its dates, each its own row.
+
+Events you make or change in tock go up to the server, and so do the ones
+dropped into `~/.tock/incoming/`. One date of a repeating series is changed
+on the server, not in tock. If the password changes, press `K` again with
+the same server and user.
 
 Outlook needs none of this: `O` runs the whole device-code flow. A company
 sign-in policy can expire that sign-in after some weeks; tock then shows a red

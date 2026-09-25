@@ -24,8 +24,8 @@ pub enum PollerEvent {
 /// One line for a calendar that could not sync. A provider answer that
 /// says the sign-in has run out becomes the key to press.
 pub fn sync_failure(kind: &str, name: &str, err: &str) -> String {
-    let key = if kind == "Outlook" { "O" } else { "G" };
-    if err.contains("invalid_grant") || err.contains("AADSTS") {
+    let key = match kind { "Outlook" => "O", "CalDAV" => "K", _ => "G" };
+    if err.contains("invalid_grant") || err.contains("AADSTS") || err.contains("refused the user name") {
         format!("{} {}: sign-in expired, press {} to sign in again", kind, name, key)
     } else {
         format!("{} {}: {}", kind, name, err)
@@ -167,6 +167,7 @@ fn run_sync_cycle(db: &Database, stopped: &(Mutex<bool>, Condvar)) -> (bool, Opt
         let result = match cal.source_type.as_str() {
             "google" => sync_google_calendar(db, cal, range_start, range_end),
             "outlook" => sync_outlook_calendar(db, cal, range_start, range_end),
+            "caldav" => sync_caldav_calendar(db, cal, range_start, range_end, false),
             // "local" and other types: nothing to sync remotely.
             _ => Ok(false),
         };
@@ -247,6 +248,70 @@ fn sync_google_calendar(
     }
 
     let _ = db.update_calendar_sync(cal.id, now_secs(), None);
+    Ok(any_new)
+}
+
+/// A CalDAV calendar: the server, the user name, and the password from
+/// its file, from the calendar's source_config.
+pub fn caldav_for(cal: &crate::database::Calendar) -> Option<(crate::sources::caldav::CalDav, String, serde_json::Value)> {
+    let cfg: serde_json::Value = serde_json::from_str(cal.source_config.as_deref()?).ok()?;
+    let url = cfg.get("url")?.as_str()?.to_string();
+    let user = cfg.get("username")?.as_str()?;
+    let file = crate::config::expand_path(cfg.get("password_file")?.as_str()?);
+    let password = std::fs::read_to_string(file).ok()?.trim().to_string();
+    Some((crate::sources::caldav::CalDav::new(user, &password), url, cfg))
+}
+
+/// Sync a CalDAV calendar. Its change tag is asked for first: the same
+/// tag as last time means nothing changed, and the events are not
+/// fetched, except once a day (the window moves on). `force` fetches
+/// anyway, for S. Rows the server no longer has, inside the window, go.
+pub fn sync_caldav_calendar(
+    db: &Database,
+    cal: &crate::database::Calendar,
+    range_start: i64,
+    range_end: i64,
+    force: bool,
+) -> Result<bool, String> {
+    use crate::sources::caldav;
+    let Some((dav, url, mut cfg)) = caldav_for(cal) else {
+        return Err(sync_failure("CalDAV", &cal.name, "no server, user or password file"));
+    };
+    let now = now_secs();
+    let tag = dav.ctag(&url);
+    let last_full = cfg.get("last_full").and_then(|v| v.as_i64()).unwrap_or(0);
+    let same = tag.is_some() && tag.as_deref() == cfg.get("ctag").and_then(|v| v.as_str());
+    if !force && same && now - last_full < 86400 {
+        let _ = db.update_calendar_sync(cal.id, now, None);
+        return Ok(false);
+    }
+    let resources = dav.events(&url, range_start, range_end)
+        .map_err(|e| sync_failure("CalDAV", &cal.name, &e))?;
+
+    let mut any_new = false;
+    let mut seen = std::collections::HashSet::new();
+    for r in &resources {
+        for ev in caldav::rows(r, cal.id, range_start, range_end) {
+            if let Some(id) = &ev.external_id { seen.insert(id.clone()); }
+            if let Ok(SyncResult::New | SyncResult::Updated) = db.upsert_synced_event(cal.id, &ev) {
+                any_new = true;
+            }
+        }
+    }
+    // Gone from the server: only rows it had given us (they have its
+    // address), never an event made here and not yet sent.
+    for e in db.get_events_in_range(range_start, range_end).unwrap_or_default() {
+        if e.calendar_id != cal.id { continue; }
+        let Some(ext) = e.external_id.as_deref() else { continue };
+        if ext.starts_with("http") && !seen.contains(ext)
+            && db.delete_event_by_external_id(cal.id, ext).map(|n| n > 0).unwrap_or(false)
+        {
+            any_new = true;
+        }
+    }
+    cfg["ctag"] = serde_json::json!(tag);
+    cfg["last_full"] = serde_json::json!(now);
+    let _ = db.update_calendar_sync(cal.id, now, Some(&cfg.to_string()));
     Ok(any_new)
 }
 
