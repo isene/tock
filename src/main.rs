@@ -850,7 +850,7 @@ impl App {
     // ----- Status bar -----
 
     fn render_status_bar(&mut self) {
-        let keys = "d/D:Day  w/W:Week  m/M:Month  y/Y:Year  e/E:Event  n:New  g:GoTo  t:Today  i:Import  G:Google  O:Outlook  S:Sync  C:Cal  P:Prefs  ?:Help  q:Quit";
+        let keys = "d/D:Day  w/W:Week  m/M:Month  y/Y:Year  e/E:Event  n:New  g:GoTo  t:Today  i:Import  G:Google  O:Outlook  K:CalDAV  S:Sync  C:Cal  P:Prefs  ?:Help  q:Quit";
         let version = format!("tock v{}", env!("CARGO_PKG_VERSION"));
         let w = self.cols as usize;
         // Right of the keys: the sync in progress, else a calendar that
@@ -1523,6 +1523,7 @@ impl App {
             "i" => self.import_ics_file(),
             "G" => self.setup_google_calendar(),
             "O" => self.setup_outlook_calendar(),
+            "K" => self.setup_caldav(),
             "S" => self.manual_sync(),
             "C" => self.show_calendars(),
             "C-R" => {
@@ -1653,6 +1654,37 @@ impl App {
                 }
                 true
             }
+            "caldav" => {
+                let Some((dav, url, _)) = poller::caldav_for(cal) else {
+                    self.show_feedback("Saved locally; the CalDAV calendar has no password file (K sets it)", 214);
+                    return true;
+                };
+                let uid = data.metadata.as_ref().and_then(|m| m.get("ics_uid")).and_then(|v| v.as_str())
+                    .map(String::from).unwrap_or_else(sources::caldav::new_uid);
+                let ics = sources::caldav::to_ics(&data, &uid);
+                let sent = match data.external_id.clone() {
+                    Some(href) if sources::caldav::is_repeat(&href) => {
+                        self.show_feedback("Saved here only: a repeat of a series is changed on the server", 214);
+                        return true;
+                    }
+                    Some(href) => dav.put(&href, &ics, false),
+                    None => {
+                        let href = sources::caldav::new_href(&url, &uid);
+                        let r = dav.put(&href, &ics, true);
+                        if r.is_ok() {
+                            data.id = Some(local_id);
+                            data.external_id = Some(href);
+                            data.metadata = Some(serde_json::json!({ "ics_uid": uid }));
+                            let _ = self.db.save_event(&data);
+                        }
+                        r
+                    }
+                };
+                if let Err(e) = sent {
+                    self.show_feedback(&format!("Saved locally, CalDAV push failed: {e}"), 196);
+                }
+                true
+            }
             "outlook" => {
                 // Outlook write-back not yet wired; warn user.
                 self.show_feedback("Saved locally; Outlook write-back not implemented",
@@ -1721,6 +1753,13 @@ impl App {
                 let mut gc = crate::sources::google::GoogleCalendar::new(email, safe_dir);
                 if gc.get_access_token().is_none() { return; }
                 let _ = gc.delete_event(google_cal_id, external_id);
+            }
+            "caldav" if !sources::caldav::is_repeat(external_id) => {
+                if let Some((dav, _, _)) = poller::caldav_for(cal) {
+                    if let Err(e) = dav.delete(external_id) {
+                        self.show_feedback(&format!("Deleted here; CalDAV delete failed: {e}"), 196);
+                    }
+                }
             }
             _ => {}
         }
@@ -2783,14 +2822,81 @@ impl App {
             &format!("Outlook re-authenticated ({} calendar(s)). Press S to sync.", updated), 46);
     }
 
+    /// K: add the calendars of a CalDAV account (iCloud, Fastmail,
+    /// Nextcloud, Radicale, …), or give an account a new password. The
+    /// password is kept in a file only you can read, beside the Google
+    /// credentials; every calendar that takes events is added and on
+    /// (C turns any off). Calendars already here keep their settings.
+    fn setup_caldav(&mut self) {
+        self.blank_bottom(&style::bold(&style::fg(" CalDAV Setup: iCloud, Fastmail, Nextcloud, Radicale …", 39)));
+        let server = self.bottom_ask(" Server (iCloud: https://caldav.icloud.com): ", "https://");
+        let server = server.trim().trim_end_matches('/').to_string();
+        if server.is_empty() || server == "https:" { self.render_all(); return; }
+        let user = self.bottom_ask(" User name (iCloud: your Apple ID): ", "");
+        let user = user.trim().to_string();
+        if user.is_empty() { self.render_all(); return; }
+        let password = self.bottom_ask_secret(" Password (iCloud: an app-specific one, from account.apple.com): ");
+        if password.is_empty() { self.render_all(); return; }
+
+        self.blank_bottom(&style::bold(&style::fg(" Looking for calendars …", 46)));
+        let dav = sources::caldav::CalDav::new(&user, &password);
+        let found = match dav.discover(&server) {
+            Ok(f) => f,
+            Err(e) => {
+                self.render_all();
+                self.show_feedback(&format!("CalDAV: {e}"), 196);
+                return;
+            }
+        };
+        if found.is_empty() {
+            self.render_all();
+            self.show_feedback("CalDAV: signed in, but the account has no calendar that takes events", 214);
+            return;
+        }
+        let host: String = server.split("://").nth(1).unwrap_or(&server).split('/').next().unwrap_or("")
+            .chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' { c } else { '-' }).collect();
+        let who: String = user.chars().map(|c| if c.is_ascii_alphanumeric() || "@._-".contains(c) { c } else { '-' }).collect();
+        let safe_dir = self.config.get_str("google.safe_dir", "~/.config/tock/credentials");
+        let file = format!("{}/caldav-{host}-{who}.txt", safe_dir.trim_end_matches('/'));
+        if let Err(e) = sources::google::write_private(&crate::config::expand_path(&file), &password) {
+            self.render_all();
+            self.show_feedback(&format!("CalDAV: could not keep the password: {e}"), 196);
+            return;
+        }
+        let have: Vec<String> = self.db.get_calendars(false).unwrap_or_default().into_iter()
+            .filter(|c| c.source_type == "caldav")
+            .filter_map(|c| c.source_config.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()))
+            .filter_map(|cfg| cfg.get("url").and_then(|v| v.as_str()).map(String::from))
+            .collect();
+        let mut added = 0;
+        for c in found.iter().filter(|c| !have.contains(&c.url)) {
+            let colour = c.color.as_deref().and_then(style::parse_hex_color)
+                .map(|(r, g, b)| style::rgb_to_xterm(r, g, b) as i64)
+                .unwrap_or(39);
+            let cfg = serde_json::json!({ "url": c.url, "username": user, "password_file": file });
+            if self.db.add_calendar(&c.name, "caldav", &cfg.to_string(), colour, true).is_ok() {
+                added += 1;
+            }
+        }
+        self.manual_sync();
+        self.render_all();
+        if added == 0 {
+            self.show_feedback(&format!("CalDAV: password kept for {user}; its calendars were here already."), 46);
+        } else {
+            self.show_feedback(&format!("CalDAV: {added} calendar(s) added and synced; C turns any off."), 46);
+        }
+    }
+
     fn manual_sync(&mut self) {
         let google_cals: Vec<_> = self.db.get_calendars(true).unwrap_or_default()
             .into_iter().filter(|c| c.source_type == "google").collect();
         let outlook_cals: Vec<_> = self.db.get_calendars(true).unwrap_or_default()
             .into_iter().filter(|c| c.source_type == "outlook").collect();
+        let caldav_cals: Vec<_> = self.db.get_calendars(true).unwrap_or_default()
+            .into_iter().filter(|c| c.source_type == "caldav").collect();
 
-        if google_cals.is_empty() && outlook_cals.is_empty() {
-            self.show_feedback("No remote calendars configured. Press G (Google) or O (Outlook) to set up.", 245);
+        if google_cals.is_empty() && outlook_cals.is_empty() && caldav_cals.is_empty() {
+            self.show_feedback("No remote calendars configured. Press G (Google), O (Outlook) or K (CalDAV) to set up.", 245);
             return;
         }
 
@@ -2870,6 +2976,13 @@ impl App {
                 let _ = self.db.update_calendar_sync(cal.id, now, new_cfg.as_deref());
             } else {
                 failed.push(poller::sync_failure("Outlook", &cal.name, oc.last_error.as_deref().unwrap_or("fetch failed")));
+            }
+        }
+
+        for cal in &caldav_cals {
+            match poller::sync_caldav_calendar(&self.db, cal, range_start, range_end, true) {
+                Ok(n) => any_new |= n,
+                Err(e) => failed.push(e),
             }
         }
 
@@ -3243,7 +3356,7 @@ impl App {
         lines.push(sep.clone());
         lines.push(format!("  {}  {}   {}  {}   {}  {}", k("i"), d("Import ICS"), k("G"), d("Google setup"), k("O"), d("Outlook setup")));
         lines.push(format!("  {}  {}     {}  {}      {}  {}", k("S"), d("Sync now"), k("C"), d("Calendars"), k("P"), d("Preferences")));
-        lines.push(format!("  {}  {}", k("q"), d("Quit")));
+        lines.push(format!("  {}  {}   {}  {}", k("K"), d("CalDAV setup (iCloud, Fastmail, Nextcloud)"), k("q"), d("Quit")));
         lines.push(String::new());
         lines.push(format!("  {}", style::fg("Press any key to close...", 245)));
 
@@ -3282,6 +3395,15 @@ impl App {
         }
         self.bottom.set_text(&lines.join("\n"));
         self.bottom.full_refresh();
+    }
+
+    /// The same prompt, with what is typed hidden: for a password.
+    fn bottom_ask_secret(&mut self, prompt: &str) -> String {
+        let mut prompt_pane = Pane::new(1, self.bottom.y + 3, self.cols, 1, 255, 0);
+        prompt_pane.border = false;
+        prompt_pane.scroll = false;
+        prompt_pane.secret = true;
+        prompt_pane.ask(prompt, "")
     }
 
     fn bottom_ask(&mut self, prompt: &str, default: &str) -> String {
