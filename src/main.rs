@@ -2582,6 +2582,12 @@ impl App {
         self.show_feedback(&msg, color);
     }
 
+    /// G: connect a Google account, or sign in again when its token has
+    /// lapsed. The OAuth client file from Google Cloud Console goes into
+    /// the credentials folder as `<email>.json`; the browser sign-in
+    /// leaves the refresh token beside it; every calendar of the account
+    /// is added, the main one on and the rest off (C turns them on).
+    /// Calendars already here are left as they are.
     fn setup_google_calendar(&mut self) {
         self.blank_bottom(&style::bold(&style::fg(" Google Calendar Setup", 39)));
         let email = self.bottom_ask(" Google email: ", "");
@@ -2589,11 +2595,74 @@ impl App {
         let email = email.trim().to_string();
 
         let safe_dir = self.config.get_str("google.safe_dir", "~/.config/tock/credentials");
-        self.show_feedback("Connecting to Google Calendar...", 226);
+        let dir = crate::config::expand_path(&safe_dir);
+        let client = dir.join(format!("{email}.json"));
+        if !client.exists() {
+            let offer = newest_client_file().map(|p| p.display().to_string()).unwrap_or_default();
+            let from = self.bottom_ask(" OAuth client file from Google Cloud (a Desktop app): ", &offer);
+            let from = crate::config::expand_path(from.trim());
+            let copied = std::fs::read_to_string(&from)
+                .map_err(|e| format!("{}: {e}", from.display()))
+                .and_then(|text| sources::google::write_private(&client, &text));
+            if let Err(e) = copied {
+                self.render_all();
+                self.show_feedback(&format!("No client file: {e}"), 196);
+                return;
+            }
+        }
 
-        let _google = sources::google::GoogleCalendar::new(&email, Some(&safe_dir));
-        // Google calendar setup is complex; show instructions
-        self.show_feedback("Google Calendar: see credentials setup documentation", 245);
+        let mut gc = sources::google::GoogleCalendar::new(&email, Some(&safe_dir));
+        self.blank_bottom(&style::bold(&style::fg(
+            " Browser opened: sign in to Google and allow tock   (its address is on your clipboard)", 46)));
+        let open = |url: &str| {
+            crust::clipboard_copy(url, "clipboard");
+            let _ = std::process::Command::new("xdg-open").arg(url)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map(|mut c| { std::thread::spawn(move || c.wait()); });
+        };
+        let mut paste = |prompt: &str| self.bottom_ask(prompt, "");
+        if let Err(e) = gc.authorize(&open, &mut paste) {
+            self.render_all();
+            self.show_feedback(&format!("Google sign-in failed: {e}"), 196);
+            return;
+        }
+
+        let cals = gc.list_calendars();
+        if cals.is_empty() {
+            self.render_all();
+            self.show_feedback(&format!("Signed in, but Google listed no calendars: {}",
+                gc.last_error.clone().unwrap_or_default()), 214);
+            return;
+        }
+        let have: Vec<String> = self.db.get_calendars(false).unwrap_or_default().into_iter()
+            .filter(|c| c.source_type == "google")
+            .filter_map(|c| c.source_config.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()))
+            .filter(|cfg| cfg.get("email").and_then(|v| v.as_str()) == Some(email.as_str()))
+            .filter_map(|cfg| cfg.get("google_calendar_id").and_then(|v| v.as_str()).map(String::from))
+            .collect();
+        let mut added = 0;
+        for c in cals.iter().filter(|c| !have.contains(&c.id)) {
+            let colour = c.color.as_deref().and_then(style::parse_hex_color)
+                .map(|(r, g, b)| style::rgb_to_xterm(r, g, b) as i64)
+                .unwrap_or(39);
+            let cfg = serde_json::json!({ "email": email, "google_calendar_id": c.id, "safe_dir": safe_dir });
+            if self.db.add_calendar(&c.summary, "google", &cfg.to_string(), colour, c.primary).is_ok() {
+                added += 1;
+            }
+        }
+        if added > 0 {
+            self.manual_sync();
+        }
+        self.render_all();
+        if added == 0 {
+            self.show_feedback(&format!("Signed in to Google again as {email}. Press S to sync."), 46);
+        } else {
+            self.show_feedback(&format!(
+                "Google: {added} calendar(s) added and synced, the main one on; C turns on the others."), 46);
+        }
     }
 
     /// Outlook device-code auth / re-auth. Microsoft Conditional-Access
@@ -2645,9 +2714,9 @@ impl App {
         let dev = match oc.start_device_auth() {
             Some(v) => v,
             None => {
+                self.render_all();
                 self.show_feedback(&format!("Device auth failed: {}",
                     oc.last_error.clone().unwrap_or_default()), 196);
-                self.render_all();
                 return;
             }
         };
@@ -2673,17 +2742,17 @@ impl App {
         let tok = match oc.poll_for_token(&device_code) {
             Some(t) => t,
             None => {
+                self.render_all();
                 self.show_feedback(&format!("Auth failed/expired: {}",
                     oc.last_error.clone().unwrap_or_default()), 196);
-                self.render_all();
                 return;
             }
         };
 
         if existing.is_empty() {
+            self.render_all();
             self.show_feedback(
                 "Authenticated, but no existing Outlook calendar to attach (provision one first).", 220);
-            self.render_all();
             return;
         }
 
@@ -2709,9 +2778,9 @@ impl App {
                 updated += 1;
             }
         }
+        self.render_all();
         self.show_feedback(
             &format!("Outlook re-authenticated ({} calendar(s)). Press S to sync.", updated), 46);
-        self.render_all();
     }
 
     fn manual_sync(&mut self) {
@@ -3633,6 +3702,30 @@ fn flush_stdin() {
 
 /// One-shot: push a single local-only event to its remote (Google) calendar
 /// and persist the returned external_id back. Returns process exit code.
+/// The newest `client_secret_*.json` in the download folder: the name
+/// Google Cloud Console gives an OAuth client file.
+fn newest_client_file() -> Option<std::path::PathBuf> {
+    std::fs::read_dir(download_dir()).ok()?
+        .flatten()
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().to_string();
+            n.starts_with("client_secret") && n.ends_with(".json")
+        })
+        .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
+        .map(|e| e.path())
+}
+
+/// The download folder the desktop names in ~/.config/user-dirs.dirs,
+/// else ~/Downloads.
+fn download_dir() -> std::path::PathBuf {
+    let home = crate::config::home_dir();
+    std::fs::read_to_string(home.join(".config/user-dirs.dirs")).ok()
+        .and_then(|t| t.lines().find_map(|l| l.strip_prefix("XDG_DOWNLOAD_DIR=").map(String::from)))
+        .map(|v| v.trim_matches('"').replace("$HOME", &home.to_string_lossy()))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| home.join("Downloads"))
+}
+
 fn push_event_oneshot(event_id: i64) -> i32 {
     let db = match Database::new(None) {
         Ok(d) => d,

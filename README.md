@@ -87,31 +87,30 @@ of that copy. Every commit is forced to the disk before it returns.
 
 ## Google Calendar
 
-Syncing works. The `G` key does not set it up yet: it asks for the email
-and then points at documentation, so the three steps below are manual.
+Google wants an OAuth client of your own, made once in Google Cloud Console:
 
-1. Get an OAuth client from Google Cloud (Desktop type), with the
-   Calendar API enabled. Save the JSON as `<email>.json` in
-   `~/.config/tock/credentials` (set by `google.safe_dir`).
+1. Make a project, enable the Google Calendar API, and fill in the OAuth
+   consent screen. While it is in "Testing", add yourself as a test user.
+2. Under Credentials, create an OAuth client ID of the type **Desktop app**
+   and download its JSON file.
 
-2. Mint a refresh token for the scope
-   `https://www.googleapis.com/auth/calendar` with any standard OAuth
-   loopback flow. Save the raw token as `<email>.calendar.txt` next to
-   the JSON. No helper ships with tock yet.
+Then press `G` in tock and give your Google email. tock offers the newest
+`client_secret_*.json` in your download folder; Enter takes it, and a copy
+goes into `~/.config/tock/credentials` (set by `google.safe_dir`), readable
+by you alone. The browser opens on Google's sign-in. Allow tock, and the
+page comes back to tock on a local port; nothing is pasted.
 
-3. Add the calendar to the database:
+Every calendar of the account is added. The main one is on and syncs at
+once; `C` turns on the others.
 
-```sh
-sqlite3 ~/.tock/tock.db "INSERT INTO calendars \
-  (name, source_type, source_config, color, enabled, created_at) \
-  VALUES ('Google', 'google', \
-  json_object('email','<email>','google_calendar_id','<email>'), \
-  39, 1, strftime('%s','now'));"
-```
+A web-type client works too. If it lists a return address on this machine
+(`http://localhost:8080/`, say), tock listens there. If it lists one
+elsewhere, tock asks you to paste the address the browser ends on, or just
+the code.
 
-`google_calendar_id` is your email for the primary calendar, or the
-calendar ID for any other one. Press `S` in tock to sync, or wait for
-the poller (`google.sync_interval`, 300 s).
+A client still in "Testing" gets a sign-in that lapses after a week. Press
+`G` again with the same email: tock signs in anew and leaves the calendars
+as they are. Publishing the consent screen ends the weekly sign-in.
 
 Outlook needs none of this: `O` runs the whole device-code flow. A company
 sign-in policy can expire that sign-in after some weeks; tock then shows a red

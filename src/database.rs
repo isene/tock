@@ -622,6 +622,17 @@ impl Database {
             .collect())
     }
 
+    /// Add a calendar and give back its id.
+    pub fn add_calendar(&self, name: &str, source_type: &str, source_config: &str, color: i64, enabled: bool) -> Result<i64> {
+        let mut s = self.store();
+        s.run(
+            "INSERT INTO calendars (name, source_type, source_config, color, enabled, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            vals![name, source_type, source_config, color, enabled as i64, now_secs()],
+        )?;
+        Ok(s.last_id())
+    }
+
     pub fn update_calendar_color(&self, id: i64, color: i64) -> Result<()> {
         self.store().run("UPDATE calendars SET color = ?1 WHERE id = ?2", vals![color, id])?;
         Ok(())

@@ -13,6 +13,15 @@ pub fn home_dir() -> PathBuf {
     }
 }
 
+/// A path as typed, with a leading `~` meaning the home directory.
+pub fn expand_path(p: &str) -> PathBuf {
+    match p.strip_prefix("~/") {
+        Some(rest) => home_dir().join(rest),
+        None if p == "~" => home_dir(),
+        None => PathBuf::from(p),
+    }
+}
+
 /// ~/.tock
 pub fn tock_home() -> PathBuf {
     home_dir().join(".tock")
