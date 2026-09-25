@@ -11,6 +11,8 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+const CALENDAR_SCOPE: &str = "https://www.googleapis.com/auth/calendar";
 const CALENDAR_API_BASE: &str = "https://www.googleapis.com/calendar/v3";
 
 // ---------------------------------------------------------------------------
@@ -22,6 +24,18 @@ pub struct GoogleCal {
     pub summary: String,
     pub primary: bool,
     pub color: Option<String>,
+}
+
+/// What the OAuth client file from Google Cloud Console holds.
+struct Client {
+    id: String,
+    secret: String,
+    /// A Desktop client ("installed"): Google sends the answer to any
+    /// port on 127.0.0.1.
+    desktop: bool,
+    /// The return addresses registered for it; a web client may only use
+    /// one of these, exactly.
+    redirects: Vec<String>,
 }
 
 pub struct GoogleCalendar {
@@ -68,44 +82,8 @@ impl GoogleCalendar {
         }
 
         let base = expand_tilde(&self.safe_dir);
-
-        // Read client credentials JSON.
-        let creds_path = PathBuf::from(&base).join(format!("{}.json", self.email));
-        let creds_json = match fs::read_to_string(&creds_path) {
-            Ok(s) => s,
-            Err(e) => {
-                self.last_error = Some(format!("Cannot read credentials: {}", e));
-                return None;
-            }
-        };
-        let creds: Value = match serde_json::from_str(&creds_json) {
-            Ok(v) => v,
-            Err(e) => {
-                self.last_error = Some(format!("Invalid credentials JSON: {}", e));
-                return None;
-            }
-        };
-
-        // Try "web" first, then "installed" (Google Cloud Console variants).
-        let app = creds.get("web")
-            .or_else(|| creds.get("installed"));
-        let (client_id, client_secret) = match app {
-            Some(a) => {
-                let id = a.get("client_id").and_then(Value::as_str);
-                let secret = a.get("client_secret").and_then(Value::as_str);
-                match (id, secret) {
-                    (Some(i), Some(s)) => (i.to_string(), s.to_string()),
-                    _ => {
-                        self.last_error = Some("Missing client_id or client_secret".into());
-                        return None;
-                    }
-                }
-            }
-            None => {
-                self.last_error = Some("No 'web' or 'installed' key in credentials".into());
-                return None;
-            }
-        };
+        let c = self.read_client(&base)?;
+        let (client_id, client_secret) = (c.id, c.secret);
 
         // Read refresh token (try {email}.calendar.txt, then {email}.txt).
         let refresh_token = self.read_refresh_token(&base)?;
@@ -153,6 +131,119 @@ impl GoogleCalendar {
                 None
             }
         }
+    }
+
+    /// The OAuth client, from `<email>.json` in the safe dir: the file
+    /// Google Cloud Console hands out, "installed" or "web".
+    fn read_client(&mut self, base: &str) -> Option<Client> {
+        let creds_path = PathBuf::from(base).join(format!("{}.json", self.email));
+        let creds_json = match fs::read_to_string(&creds_path) {
+            Ok(s) => s,
+            Err(e) => {
+                self.last_error = Some(format!("Cannot read credentials: {}", e));
+                return None;
+            }
+        };
+        let creds: Value = match serde_json::from_str(&creds_json) {
+            Ok(v) => v,
+            Err(e) => {
+                self.last_error = Some(format!("Invalid credentials JSON: {}", e));
+                return None;
+            }
+        };
+        let Some(app) = creds.get("web").or_else(|| creds.get("installed")) else {
+            self.last_error = Some("No 'web' or 'installed' key in credentials".into());
+            return None;
+        };
+        let desktop = creds.get("installed").is_some();
+        let redirects = app.get("redirect_uris").and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+            .unwrap_or_default();
+        match (app.get("client_id").and_then(Value::as_str), app.get("client_secret").and_then(Value::as_str)) {
+            (Some(i), Some(s)) => Some(Client { id: i.to_string(), secret: s.to_string(), desktop, redirects }),
+            _ => {
+                self.last_error = Some("Missing client_id or client_secret".into());
+                None
+            }
+        }
+    }
+
+    /// Sign in through the browser and keep the refresh token, written to
+    /// `<email>.calendar.txt` in the safe dir. `open` shows Google's page.
+    ///
+    /// Google's answer carries a code, sent to the client's return
+    /// address. A Desktop client may use any port on 127.0.0.1, and a
+    /// web client one registered on this machine: tock listens there and
+    /// nothing is pasted. A web client registered elsewhere (a helper
+    /// page) sends the browser there, and `paste` asks for the address it
+    /// ends on, or just the code. Gives up after five minutes.
+    pub fn authorize(&mut self, open: &dyn Fn(&str), paste: &mut dyn FnMut(&str) -> String) -> Result<(), String> {
+        let base = expand_tilde(&self.safe_dir);
+        let client = self.read_client(&base)
+            .ok_or_else(|| self.last_error.clone().unwrap_or_default())?;
+        // Where Google sends the answer, and a port to catch it on when
+        // that is this machine.
+        let local = client.redirects.iter().find_map(|r| local_port(r).map(|p| (r.clone(), p)));
+        let (redirect, listener) = match (client.desktop, local) {
+            (true, _) => {
+                let l = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+                let port = l.local_addr().map_err(|e| e.to_string())?.port();
+                (format!("http://127.0.0.1:{port}"), Some(l))
+            }
+            (false, Some((r, port))) => {
+                let l = std::net::TcpListener::bind(("127.0.0.1", port))
+                    .map_err(|e| format!("port {port} for {r}: {e}"))?;
+                (r, Some(l))
+            }
+            (false, None) => match client.redirects.first() {
+                Some(r) => (r.clone(), None),
+                None => return Err("the client file lists no return address (redirect_uris)".into()),
+            },
+        };
+        // Ties Google's answer to this sign-in, so no other page can
+        // hand tock a code.
+        let state = format!("{:x}{:x}", now_nanos(), std::process::id());
+        let url = format!(
+            "{}?client_id={}&redirect_uri={}&response_type=code&scope={}&access_type=offline&prompt=consent&state={}",
+            GOOGLE_AUTH_URL, url_encode(&client.id), url_encode(&redirect), url_encode(CALENDAR_SCOPE), state
+        );
+        open(&url);
+        let code = match &listener {
+            Some(l) => wait_for_code(l, &state, std::time::Duration::from_secs(300))?,
+            None => code_from_paste(&paste(" Sign in, then paste the address the browser ends on (or the code): "), &state)?,
+        };
+
+        let body = format!(
+            "code={}&client_id={}&client_secret={}&redirect_uri={}&grant_type=authorization_code",
+            url_encode(&code), url_encode(&client.id), url_encode(&client.secret), url_encode(&redirect)
+        );
+        let json: Value = ureq::post(GOOGLE_TOKEN_URL)
+            .set("Content-Type", "application/x-www-form-urlencoded")
+            .timeout(std::time::Duration::from_secs(15))
+            .send_string(&body)
+            .map_err(|e| match e {
+                ureq::Error::Status(_, r) => {
+                    // Google's answer is a JSON object; its own words are
+                    // in error_description, else error.
+                    let v: Value = r.into_json().unwrap_or(Value::Null);
+                    let why = v.get("error_description").or_else(|| v.get("error"))
+                        .and_then(Value::as_str).unwrap_or("no reason given");
+                    format!("Google refused the code: {why}")
+                }
+                e => format!("token request failed: {e}"),
+            })?
+            .into_json()
+            .map_err(|e| format!("token answer unreadable: {e}"))?;
+        let refresh = json.get("refresh_token").and_then(Value::as_str)
+            .ok_or_else(|| format!("Google sent no refresh token: {json}"))?;
+        let path = PathBuf::from(&base).join(format!("{}.calendar.txt", self.email));
+        write_private(&path, refresh)?;
+        if let Some(tok) = json.get("access_token").and_then(Value::as_str) {
+            self.access_token = Some(tok.to_string());
+            self.token_expires_at = now_epoch() + json.get("expires_in").and_then(Value::as_i64).unwrap_or(3600);
+        }
+        self.last_error = None;
+        Ok(())
     }
 
     fn read_refresh_token(&mut self, base: &str) -> Option<String> {
@@ -785,6 +876,122 @@ fn ts_to_date_str(ts: i64) -> String {
 // ---------------------------------------------------------------------------
 
 /// Percent-encode a string for use in URLs.
+fn now_nanos() -> u128 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+}
+
+/// A file only its owner can read, for a secret.
+pub fn write_private(path: &std::path::Path, text: &str) -> Result<(), String> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    }
+    let mut f = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600)
+        .open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    std::io::Write::write_all(&mut f, text.as_bytes()).map_err(|e| e.to_string())
+}
+
+/// Wait on the port for the browser to come back from Google, answer it
+/// with a line the user can read, and give back the code it carried.
+/// Other requests (a favicon) are answered and ignored. Looks for a
+/// connection five times a second, only while the sign-in lasts.
+fn wait_for_code(listener: &std::net::TcpListener, state: &str, limit: std::time::Duration) -> Result<String, String> {
+    use std::io::{Read, Write};
+    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let until = std::time::Instant::now() + limit;
+    while std::time::Instant::now() < until {
+        let (mut conn, _) = match listener.accept() {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                continue;
+            }
+            Err(e) => return Err(e.to_string()),
+        };
+        let _ = conn.set_nonblocking(false);
+        let _ = conn.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+        let mut buf = [0u8; 8192];
+        let n = conn.read(&mut buf).unwrap_or(0);
+        let request = String::from_utf8_lossy(&buf[..n]).to_string();
+        let params = request_params(&request);
+        let (reply, result) = match (params.get("code"), params.get("error")) {
+            (Some(code), _) if params.get("state").map(String::as_str) == Some(state) => {
+                ("tock has Google's answer. You can close this tab and go back to tock.", Some(Ok(code.clone())))
+            }
+            (Some(_), _) => ("This answer was not for tock's sign-in; nothing was kept.", None),
+            (None, Some(err)) => ("Google said no; nothing was kept. tock shows why.", Some(Err(format!("Google: {err}")))),
+            (None, None) => ("", None),
+        };
+        let page = format!("<!doctype html><meta charset=utf-8><title>tock</title><p style=\"font:1.2em sans-serif\">{reply}</p>");
+        let _ = write!(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}", page.len());
+        if let Some(r) = result {
+            return r;
+        }
+    }
+    Err("no answer from Google within five minutes".into())
+}
+
+/// The port of a return address on this machine, as a web client must
+/// name it: `http://localhost:8080/` or `http://127.0.0.1:8080`.
+fn local_port(redirect: &str) -> Option<u16> {
+    let rest = redirect.strip_prefix("http://localhost:").or_else(|| redirect.strip_prefix("http://127.0.0.1:"))?;
+    rest.split(['/', '?']).next()?.parse().ok()
+}
+
+/// The code from what the user pasted: the whole address the browser
+/// ended on (its state must be this sign-in's), or the code alone.
+fn code_from_paste(pasted: &str, state: &str) -> Result<String, String> {
+    let pasted = pasted.trim();
+    if pasted.is_empty() {
+        return Err("nothing pasted".into());
+    }
+    if !pasted.contains("code=") && !pasted.contains("error=") {
+        return Ok(pasted.to_string());
+    }
+    let params = request_params(&format!("GET {} HTTP/1.1", pasted));
+    if let Some(err) = params.get("error") {
+        return Err(format!("Google: {err}"));
+    }
+    match (params.get("code"), params.get("state")) {
+        (Some(_), Some(s)) if s != state => Err("that address is from another sign-in".into()),
+        (Some(c), _) => Ok(c.clone()),
+        (None, _) => Err("no code in what was pasted".into()),
+    }
+}
+
+/// The query parameters of an HTTP request's first line, decoded.
+fn request_params(request: &str) -> std::collections::HashMap<String, String> {
+    let target = request.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("");
+    let query = target.split_once('?').map(|(_, q)| q).unwrap_or("");
+    query.split('&').filter_map(|kv| {
+        let (k, v) = kv.split_once('=')?;
+        Some((url_decode(k), url_decode(v)))
+    }).collect()
+}
+
+fn url_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'+' => out.push(b' '),
+            b'%' if i + 2 < b.len() => {
+                let hex = |c: u8| (c as char).to_digit(16);
+                match (hex(b[i + 1]), hex(b[i + 2])) {
+                    (Some(h), Some(l)) => { out.push((h * 16 + l) as u8); i += 2; }
+                    _ => out.push(b'%'),
+                }
+            }
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
 fn url_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 3);
     for b in s.bytes() {
@@ -807,5 +1014,72 @@ fn expand_tilde(path: &str) -> String {
         format!("{}{}", home.display(), &path[1..])
     } else {
         path.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    /// A browser coming back to the port: the request it sends, and the
+    /// page it gets.
+    fn browse(port: u16, target: &str) -> String {
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(s, "GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
+        let mut page = String::new();
+        let _ = s.read_to_string(&mut page);
+        page
+    }
+
+    #[test]
+    fn the_port_takes_the_code_meant_for_it() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let browser = std::thread::spawn(move || {
+            let icon = browse(port, "/favicon.ico");
+            let stray = browse(port, "/?state=other&code=nope");
+            let page = browse(port, "/?state=s1&code=4%2F0Ab_x&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcalendar");
+            (icon, stray, page)
+        });
+        let code = wait_for_code(&l, "s1", std::time::Duration::from_secs(10));
+        let (icon, stray, page) = browser.join().unwrap();
+        assert_eq!(code.as_deref(), Ok("4/0Ab_x"));
+        assert!(icon.starts_with("HTTP/1.1 200"), "a favicon is answered too");
+        assert!(stray.contains("not for tock"));
+        assert!(page.contains("has Google"));
+    }
+
+    #[test]
+    fn a_refusal_comes_back_as_the_reason() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let browser = std::thread::spawn(move || browse(port, "/?error=access_denied&state=s1"));
+        let got = wait_for_code(&l, "s1", std::time::Duration::from_secs(10));
+        browser.join().unwrap();
+        assert_eq!(got, Err("Google: access_denied".to_string()));
+    }
+
+    #[test]
+    fn a_pasted_address_or_code_gives_the_code() {
+        assert_eq!(code_from_paste(" https://helper.example.com/?state=s1&code=4%2F0Ab&scope=x ", "s1"), Ok("4/0Ab".into()));
+        assert_eq!(code_from_paste("4/0AbCd", "s1"), Ok("4/0AbCd".into()));
+        assert!(code_from_paste("https://helper.example.com/?state=old&code=4%2F0Ab", "s1").is_err());
+        assert_eq!(code_from_paste("https://helper.example.com/?error=access_denied&state=s1", "s1"), Err("Google: access_denied".into()));
+        assert!(code_from_paste("  ", "s1").is_err());
+    }
+
+    #[test]
+    fn a_return_address_here_gives_its_port() {
+        assert_eq!(local_port("http://localhost:8080/"), Some(8080));
+        assert_eq!(local_port("http://127.0.0.1:9004"), Some(9004));
+        assert_eq!(local_port("http://localhost"), None);
+        assert_eq!(local_port("https://helper.example.com/"), None);
+    }
+
+    #[test]
+    fn percent_escapes_decode() {
+        assert_eq!(url_decode("a%2Fb+c%3d%zz%"), "a/b c=%zz%");
+        assert_eq!(url_decode("%C3%B8"), "ø");
     }
 }
