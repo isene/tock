@@ -62,6 +62,7 @@ cp target/release/tock ~/.local/bin/
 | v | View event details |
 | a | Accept invite (RSVP) |
 | Ctrl+Y | Copy event to clipboard |
+| Ctrl+A | A Claude session about the screen and the seven days from the selected one (`claude` on the PATH); `/exit` comes back |
 | i | Import ICS file |
 | G | Setup Google Calendar |
 | K | Setup CalDAV (iCloud, Fastmail, Nextcloud, …) |

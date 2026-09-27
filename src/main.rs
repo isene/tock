@@ -1539,6 +1539,7 @@ impl App {
                 self.render_all();
             }
             "P" => self.show_preferences(),
+            "C-A" => self.claude(),
             "?" => self.show_help(),
             "q" => self.running = false,
             _ => {}
@@ -1548,6 +1549,62 @@ impl App {
     // =====================================================================
     // Actions
     // =====================================================================
+
+    /// Ctrl+A, as in every Fe2O3 app: a Claude session about the screen
+    /// and the seven days from the selected one.
+    fn claude(&mut self) {
+        let ctx = self.claude_context();
+        let intro = "I am in tock, my calendar app.";
+        let started = crust::claude_session("Tock", intro, &ctx);
+        Crust::clear_screen();
+        self.recreate_panes();
+        self.render_all();
+        if !started {
+            self.show_feedback("claude is not on the PATH", 196);
+        }
+    }
+
+    fn claude_context(&self) -> String {
+        let (sy, sm, sd) = self.selected_date;
+        let (ty, tm, td) = today();
+        let mut ctx = format!(
+            "Today is {}. The selected day is {}.\n\nOn screen:\n",
+            format_date_long(ty, tm, td), format_date_long(sy, sm, sd),
+        );
+        // The half-hour grid is left out: the days below list its events.
+        for p in [&self.info, &self.top, &self.bottom] {
+            ctx.push_str(&crust::strip_ansi(p.text()));
+            ctx.push('\n');
+        }
+        let tz = local_tz_offset_secs();
+        ctx.push_str("\nThe selected day and the six after it:\n");
+        for i in 0..7 {
+            let day = add_days(self.selected_date, i);
+            ctx.push_str(&format!("{}\n", format_date_long(day.0, day.1, day.2)));
+            let events = self.events_by_date.get(&day).map(|v| v.as_slice()).unwrap_or(&[]);
+            if events.is_empty() {
+                ctx.push_str("  nothing\n");
+            }
+            for e in events {
+                let when = if e.all_day {
+                    "all day".to_string()
+                } else {
+                    let (_, _, _, h1, m1, _) = ts_to_parts(e.start_time + tz);
+                    let (_, _, _, h2, m2, _) = ts_to_parts(e.end_time + tz);
+                    format!("{h1:02}:{m1:02}-{h2:02}:{m2:02}")
+                };
+                ctx.push_str(&format!("  {when}  {} ({})", e.title, e.calendar_name));
+                if let Some(l) = e.location.as_deref().filter(|l| !l.is_empty()) {
+                    ctx.push_str(&format!(" at {l}"));
+                }
+                if let Some(s) = e.my_status.as_deref() {
+                    ctx.push_str(&format!(", {}", humanize_status(s)));
+                }
+                ctx.push('\n');
+            }
+        }
+        ctx
+    }
 
     fn go_to_date(&mut self) {
         self.blank_bottom("");
@@ -3351,7 +3408,7 @@ impl App {
         lines.push(format!("  {}", style::bold(&style::fg("Events", 156))));
         lines.push(format!("  {}        {}       {}   {}", k("n"), d("New event"), k("ENTER"), d("Edit event")));
         lines.push(format!("  {}    {}    {}       {}", k("x/DEL"), d("Delete event"), k("a"), d("Accept invite")));
-        lines.push(format!("  {}        {}", k("v"), d("View event details (scrollable popup)")));
+        lines.push(format!("  {}        {}   {}   {}", k("v"), d("View event details"), k("Ctrl+A"), d("Ask Claude")));
         lines.push(format!("  {}        {}", k("r"), d("Reply via Heathrow")));
         lines.push(format!("  {}        {}", k("J"), d("Join meeting (per-host handler from config, else browser)")));
         lines.push(sep.clone());
