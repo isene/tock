@@ -2621,8 +2621,11 @@ impl App {
         }
         let spawned = cmd.spawn();
         match spawned {
-            Ok(_) if !fallback => self.show_feedback(
-                &format!("Joining via {}…", launcher), 156),
+            Ok(_) if !fallback => {
+                // xdg-open is only the messenger: name the browser it hands to.
+                let via = if launcher == "xdg-open" { default_browser().unwrap_or_else(|| "your browser".into()) } else { launcher.clone() };
+                self.show_feedback(&format!("Joining via {}…", via), 156)
+            }
             Ok(_) => {}  // already showed the fallback note above
             Err(e) => self.show_feedback(
                 &format!("Couldn't launch {}: {}", launcher, e), 196),
@@ -3855,6 +3858,28 @@ fn url_host(url: &str) -> Option<String> {
 /// symlinks or check exec bits exhaustively — `is_file()` plus the
 /// path's existence is enough for the "is teams-for-linux installed"
 /// gate the join flow needs.
+/// The default browser's name, from the desktop's list of default apps
+/// (~/.config/mimeapps.list): the program `xdg-open` hands a web link to.
+fn default_browser() -> Option<String> {
+    let dir = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))?;
+    browser_in(&std::fs::read_to_string(dir.join("mimeapps.list")).ok()?)
+}
+
+/// The https handler in a mimeapps.list's [Default Applications], without
+/// ".desktop".
+fn browser_in(list: &str) -> Option<String> {
+    let mut defaults = false;
+    for line in list.lines().map(str::trim) {
+        if line.starts_with('[') { defaults = line == "[Default Applications]"; continue; }
+        if let (true, Some(v)) = (defaults, line.strip_prefix("x-scheme-handler/https=")) {
+            let app = v.split(';').next()?.trim();
+            return Some(app.strip_suffix(".desktop").unwrap_or(app).to_string());
+        }
+    }
+    None
+}
+
 fn which_on_path(cmd: &str) -> bool {
     let path = match std::env::var_os("PATH") { Some(p) => p, None => return false };
     for dir in std::env::split_paths(&path) {
@@ -4115,6 +4140,13 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_default_browser_comes_from_default_applications() {
+        let list = "[Default Applications]\nx-scheme-handler/http=gaze.desktop\nx-scheme-handler/https=gaze.desktop\n\n[Added Associations]\nx-scheme-handler/https=firefox.desktop;\n";
+        assert_eq!(browser_in(list).as_deref(), Some("gaze"));
+        assert_eq!(browser_in("[Added Associations]\nx-scheme-handler/https=firefox.desktop;\n"), None);
+    }
 
     fn ev(id: i64, start: i64, end: i64) -> Event {
         Event {
