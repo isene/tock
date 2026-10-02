@@ -30,7 +30,7 @@ Terminal calendar with week view, event management, astronomy, and weather. Buil
 - **Preferences**: 15 configurable settings with inline color picker (256-color grid)
 - **Calendar manager**: enable/disable calendars, change colors, remove
 - **Kastrup integration**: reply to events via Kastrup (r key), jump to Kastrup (Z key)
-- **Database**: SQLite in ~/.tock/tock.db, or [ferrite](https://github.com/isene/ferrite) with `database: ferrite` in the config
+- **Database**: [ferrite](https://github.com/isene/ferrite) in ~/.tock/tock.ferrite/, or SQLite with `database: sqlite` in the config
 
 ## Install
 
@@ -81,11 +81,14 @@ Config file: `~/.tock/config.yml`
 
 Settings include location (for astronomy/weather), work hours, calendar colors, sync intervals, and notification preferences.
 
-`database: ferrite` swaps SQLite for [ferrite](https://github.com/isene/ferrite),
-the Fe₂O₃ database that keeps its tables in memory. The first start copies
-everything out of `tock.db` into `~/.tock/tock.ferrite/` and leaves the
-SQLite file as it was, so `database: sqlite` takes you back to the data as
-of that copy. Every commit is forced to the disk before it returns.
+tock keeps its calendars in [ferrite](https://github.com/isene/ferrite),
+the Fe₂O₃ database that keeps its tables in memory. Every commit is forced
+to the disk before it returns.
+
+Coming from a tock that used SQLite? The first start copies everything out
+of `tock.db` into `~/.tock/tock.ferrite/` and leaves the SQLite file as it
+was. `database: sqlite` in the config takes you back to the data as of
+that copy.
 
 ## Google Calendar
 

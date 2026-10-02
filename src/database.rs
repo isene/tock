@@ -1,10 +1,10 @@
 //! Where tock keeps its calendars and events.
 //!
-//! Two engines speak the same SQL here: SQLite, which is the default,
-//! and ferrite, the Fe₂O₃ database that keeps its tables in memory.
-//! `database: ferrite` in `~/.tock/config.yml` picks the second. The
-//! first time it opens, it copies everything out of `tock.db`, which is
-//! left as it was.
+//! Two engines speak the same SQL here: ferrite, the Fe₂O₃ database
+//! that keeps its tables in memory and is the default, and SQLite.
+//! `database: sqlite` in `~/.tock/config.yml` picks the second. The
+//! first time ferrite opens, it copies everything out of `tock.db`,
+//! which is left as it was.
 
 use rusqlite::{types::ValueRef, Connection};
 use serde_json::Value as JsonValue;
@@ -364,7 +364,7 @@ impl Database {
                 dir.join("tock.db")
             }
         };
-        let engine = crate::config::Config::new().get_str("database", "sqlite");
+        let engine = crate::config::Config::new().get_str("database", "ferrite");
         Database::open(&path, &engine)
     }
 
