@@ -41,6 +41,8 @@ pub struct OutlookCalendar {
     access_token: Option<String>,
     refresh_token: Option<String>,
     token_expires_at: i64,
+    /// Where the Graph API answers. A test points it at a local listener.
+    base: String,
     pub last_error: Option<String>,
 }
 
@@ -66,6 +68,7 @@ impl OutlookCalendar {
                 .and_then(Value::as_str)
                 .map(String::from),
             token_expires_at: 0,
+            base: GRAPH_BASE.to_string(),
             last_error: None,
         }
     }
@@ -367,20 +370,28 @@ impl OutlookCalendar {
         Some(all_events)
     }
 
+    /// Make the event in Outlook and give back the id Outlook gave it.
+    /// Outlook mails an invitation to every guest at once.
     pub fn create_event(&mut self, event_data: &EventData) -> Option<String> {
         let body = to_outlook_format(event_data);
         let resp = self.api_post("/me/events", &body)?;
-        resp.get("id").and_then(Value::as_str).map(String::from)
+        let id = resp.get("id").and_then(Value::as_str).map(String::from);
+        if id.is_none() {
+            self.last_error = Some("Outlook answered without an event id".into());
+        }
+        id
     }
 
-    pub fn update_event(
-        &mut self,
-        event_id: &str,
-        event_data: &EventData,
-    ) {
-        let body = to_outlook_format(event_data);
+    /// Send an edit to Outlook. Only a field with a new value goes out;
+    /// an edit that changed nothing sends no request.
+    pub fn update_event(&mut self, event_id: &str, before: &EventData, after: &EventData) -> bool {
+        let body = changed_fields(before, after);
+        if body.as_object().is_some_and(|o| o.is_empty()) {
+            self.last_error = None;
+            return true;
+        }
         let path = format!("/me/events/{}", event_id);
-        let _ = self.api_patch(&path, &body);
+        self.api_patch(&path, &body).is_some()
     }
 
     pub fn delete_event(&mut self, event_id: &str) -> bool {
@@ -454,7 +465,7 @@ impl OutlookCalendar {
         let url = if path.starts_with("http") {
             path.to_string()
         } else {
-            format!("{}{}", GRAPH_BASE, path)
+            format!("{}{}", self.base, path)
         };
 
         let resp = ureq::get(&url)
@@ -483,7 +494,7 @@ impl OutlookCalendar {
 
     fn api_post(&mut self, path: &str, body: &Value) -> Option<Value> {
         let token = self.ensure_token()?;
-        let url = format!("{}{}", GRAPH_BASE, path);
+        let url = format!("{}{}", self.base, path);
 
         let resp = ureq::post(&url)
             .set("Authorization", &format!("Bearer {}", token))
@@ -512,7 +523,7 @@ impl OutlookCalendar {
 
     fn api_patch(&mut self, path: &str, body: &Value) -> Option<Value> {
         let token = self.ensure_token()?;
-        let url = format!("{}{}", GRAPH_BASE, path);
+        let url = format!("{}{}", self.base, path);
 
         let resp = ureq::request("PATCH", &url)
             .set("Authorization", &format!("Bearer {}", token))
@@ -543,7 +554,7 @@ impl OutlookCalendar {
             Some(t) => t,
             None => return false,
         };
-        let url = format!("{}{}", GRAPH_BASE, path);
+        let url = format!("{}{}", self.base, path);
 
         let resp = ureq::delete(&url)
             .set("Authorization", &format!("Bearer {}", token))
@@ -685,34 +696,108 @@ fn to_outlook_format(event_data: &EventData) -> Value {
 
     ev["subject"] = json!(event_data.title);
 
-    if let Some(ref desc) = event_data.description {
+    if let Some(desc) = event_data.description.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
         ev["body"] = json!({
             "contentType": "text",
             "content": desc,
         });
     }
 
-    if let Some(ref loc) = event_data.location {
+    if let Some(loc) = event_data.location.as_deref().map(str::trim).filter(|l| !l.is_empty()) {
         ev["location"] = json!({ "displayName": loc });
     }
 
     ev["isAllDay"] = json!(event_data.all_day);
 
-    let tz = event_data.timezone.as_deref().unwrap_or("UTC");
+    // The stored times count seconds in UTC, so UTC is the zone to name,
+    // whatever zone the event was first written in.
     ev["start"] = json!({
         "dateTime": ts_to_iso(event_data.start_time),
-        "timeZone": tz,
+        "timeZone": "UTC",
     });
     ev["end"] = json!({
         "dateTime": ts_to_iso(event_data.end_time),
-        "timeZone": tz,
+        "timeZone": "UTC",
     });
 
-    if let Some(ref att) = event_data.attendees {
-        ev["attendees"] = att.clone();
+    let guests = guest_addresses(event_data.attendees.as_ref());
+    if !guests.is_empty() {
+        ev["attendees"] = guests.iter().map(|a| guest(a, "required")).collect();
+    }
+
+    if wants_teams(event_data) {
+        ev["isOnlineMeeting"] = json!(true);
+        ev["onlineMeetingProvider"] = json!("teamsForBusiness");
     }
 
     ev
+}
+
+fn guest(address: &str, kind: &str) -> Value {
+    json!({ "emailAddress": { "address": address }, "type": kind })
+}
+
+/// True for an event the user asked to be a Teams meeting. The new-event
+/// dialog writes the wish into the metadata; nothing else carries it.
+fn wants_teams(event_data: &EventData) -> bool {
+    event_data.metadata.as_ref()
+        .and_then(|m| m.get("teams"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// The guests' addresses, lower case and sorted. A guest typed in tock is
+/// `{"email": ...}`; one that came from Outlook is
+/// `{"emailAddress": {"address": ...}}`.
+pub fn guest_addresses(attendees: Option<&Value>) -> Vec<String> {
+    let mut out: Vec<String> = attendees
+        .and_then(Value::as_array)
+        .map(|list| list.iter().filter_map(guest_address).collect())
+        .unwrap_or_default();
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn guest_address(entry: &Value) -> Option<String> {
+    entry.get("email")
+        .or_else(|| entry.get("emailAddress").and_then(|e| e.get("address")))
+        .and_then(Value::as_str)
+        .map(|a| a.trim().to_lowercase())
+        .filter(|a| !a.is_empty())
+}
+
+/// What an edit changed, as the body of the PATCH request.
+///
+/// A field goes out only when it has a new value. The description never
+/// does: the body of a meeting holds its Teams join block, and a plain
+/// text copy sent back would wipe that block out. A field the user
+/// emptied stays as it is in Outlook, since an emptied guest list would
+/// cancel the meeting for everyone on it.
+fn changed_fields(before: &EventData, after: &EventData) -> Value {
+    let old = to_outlook_format(before);
+    let new = to_outlook_format(after);
+    let mut out = json!({});
+    for key in ["subject", "isAllDay", "start", "end", "location", "attendees"] {
+        if let Some(value) = new.get(key) {
+            if old.get(key) != Some(value) {
+                out[key] = value.clone();
+            }
+        }
+    }
+    if out.get("attendees").is_some() {
+        // A guest who was optional stays optional.
+        let kinds = before.attendees.as_ref().and_then(Value::as_array).cloned().unwrap_or_default();
+        out["attendees"] = guest_addresses(after.attendees.as_ref()).iter().map(|address| {
+            let kind = kinds.iter()
+                .find(|e| guest_address(e).as_deref() == Some(address))
+                .and_then(|e| e.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or("required");
+            guest(address, kind)
+        }).collect();
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -815,4 +900,196 @@ fn url_encode(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    fn event(title: &str) -> EventData {
+        EventData {
+            id: None,
+            calendar_id: 9,
+            external_id: None,
+            title: title.into(),
+            description: None,
+            location: None,
+            // 2026-10-12 09:00 to 10:00 UTC.
+            start_time: 1_791_795_600,
+            end_time: 1_791_799_200,
+            all_day: false,
+            timezone: None,
+            recurrence_rule: None,
+            series_master_id: None,
+            status: "confirmed".into(),
+            organizer: None,
+            attendees: None,
+            my_status: None,
+            alarms: None,
+            metadata: None,
+        }
+    }
+
+    /// A stand-in for Graph on a local port. Answers `count` requests with
+    /// `answer` and gives back what it was sent, one string per request.
+    fn graph(count: usize, answer: &'static str) -> (OutlookCalendar, std::thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..count {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = stream.read(&mut buf).unwrap();
+                    raw.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&raw).to_string();
+                    let Some(head_end) = text.find("\r\n\r\n") else { continue };
+                    let length = text.lines()
+                        .find_map(|l| l.to_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap()))
+                        .unwrap_or(0);
+                    if n == 0 || raw.len() >= head_end + 4 + length {
+                        break;
+                    }
+                }
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    answer.len(), answer);
+                stream.write_all(reply.as_bytes()).unwrap();
+                seen.push(String::from_utf8_lossy(&raw).to_string());
+            }
+            seen
+        });
+        let mut oc = OutlookCalendar::new(&json!({ "access_token": "test-token" }));
+        oc.base = base;
+        oc.token_expires_at = now_epoch() + 3600;
+        (oc, seen)
+    }
+
+    fn body_of(request: &str) -> Value {
+        serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_new_event_goes_to_outlook_as_one_post() {
+        let (mut oc, seen) = graph(1, r#"{"id":"AAMk-new"}"#);
+        let mut ev = event("Planning");
+        ev.description = Some("  Bring the numbers ".into());
+        ev.attendees = Some(json!([{ "email": " Bob@Example.com" }, { "email": "alice@example.com" }]));
+        ev.metadata = Some(json!({ "teams": true }));
+
+        assert_eq!(oc.create_event(&ev).as_deref(), Some("AAMk-new"));
+
+        let seen = seen.join().unwrap();
+        assert!(seen[0].starts_with("POST /me/events HTTP/1.1\r\n"), "{}", seen[0]);
+        assert!(seen[0].contains("Authorization: Bearer test-token\r\n"), "{}", seen[0]);
+        let body = body_of(&seen[0]);
+        assert_eq!(body["subject"], "Planning");
+        assert_eq!(body["body"], json!({ "contentType": "text", "content": "Bring the numbers" }));
+        assert_eq!(body["start"], json!({ "dateTime": "2026-10-12T09:00:00", "timeZone": "UTC" }));
+        assert_eq!(body["end"], json!({ "dateTime": "2026-10-12T10:00:00", "timeZone": "UTC" }));
+        assert_eq!(body["attendees"], json!([
+            { "emailAddress": { "address": "alice@example.com" }, "type": "required" },
+            { "emailAddress": { "address": "bob@example.com" }, "type": "required" },
+        ]));
+        assert_eq!(body["isOnlineMeeting"], true);
+        assert_eq!(body["onlineMeetingProvider"], "teamsForBusiness");
+    }
+
+    #[test]
+    fn a_plain_event_asks_for_no_teams_meeting_and_no_guests() {
+        let body = to_outlook_format(&event("Dentist"));
+        assert!(body.get("isOnlineMeeting").is_none());
+        assert!(body.get("attendees").is_none());
+        assert!(body.get("body").is_none());
+    }
+
+    /// The event as Outlook hands it back: an HTML body with the Teams
+    /// block, and guests in Outlook's own shape.
+    fn meeting_from_outlook() -> EventData {
+        let mut ev = event("Planning");
+        ev.external_id = Some("AAMk-1".into());
+        ev.description = Some("<html><body>Bring the numbers<div>Join the Teams meeting</div></body></html>".into());
+        ev.location = Some("Room 2".into());
+        ev.timezone = Some("UTC".into());
+        ev.attendees = Some(json!([
+            { "emailAddress": { "address": "Alice@Example.com", "name": "Alice" }, "type": "optional",
+              "status": { "response": "accepted" } },
+            { "emailAddress": { "address": "bob@example.com", "name": "Bob" }, "type": "required",
+              "status": { "response": "none" } },
+        ]));
+        ev
+    }
+
+    #[test]
+    fn an_edit_sends_only_what_changed() {
+        let before = meeting_from_outlook();
+
+        // A new title and a later hour; the dialog hands the guests back
+        // in tock's own shape, and the place was left empty.
+        let mut after = before.clone();
+        after.title = "Planning, round two".into();
+        after.start_time += 3600;
+        after.end_time += 3600;
+        after.location = None;
+        after.description = Some("typed over".into());
+        after.attendees = Some(json!([{ "email": "bob@example.com" }, { "email": "alice@example.com" }]));
+
+        assert_eq!(changed_fields(&before, &after), json!({
+            "subject": "Planning, round two",
+            "start": { "dateTime": "2026-10-12T10:00:00", "timeZone": "UTC" },
+            "end": { "dateTime": "2026-10-12T11:00:00", "timeZone": "UTC" },
+        }));
+    }
+
+    #[test]
+    fn a_new_guest_is_added_and_the_old_ones_stay_as_they_were() {
+        let before = meeting_from_outlook();
+        let mut after = before.clone();
+        after.attendees = Some(json!([
+            { "email": "alice@example.com" }, { "email": "bob@example.com" }, { "email": "carol@example.com" },
+        ]));
+        assert_eq!(changed_fields(&before, &after), json!({ "attendees": [
+            { "emailAddress": { "address": "alice@example.com" }, "type": "optional" },
+            { "emailAddress": { "address": "bob@example.com" }, "type": "required" },
+            { "emailAddress": { "address": "carol@example.com" }, "type": "required" },
+        ]}));
+    }
+
+    #[test]
+    fn an_emptied_guest_list_is_never_sent() {
+        let before = meeting_from_outlook();
+        let mut after = before.clone();
+        after.attendees = None;
+        assert_eq!(changed_fields(&before, &after), json!({}));
+    }
+
+    #[test]
+    fn an_edit_that_changed_nothing_sends_no_request() {
+        // Nothing listens on port 1, so a request would fail.
+        let mut oc = OutlookCalendar::new(&json!({ "access_token": "test-token" }));
+        oc.base = "http://127.0.0.1:1".into();
+        oc.token_expires_at = now_epoch() + 3600;
+        let ev = meeting_from_outlook();
+        assert!(oc.update_event("AAMk-1", &ev, &ev.clone()));
+    }
+
+    #[test]
+    fn an_edit_is_a_patch_and_a_delete_is_a_delete() {
+        let (mut oc, seen) = graph(2, r#"{"id":"AAMk-1"}"#);
+        let before = meeting_from_outlook();
+        let mut after = before.clone();
+        after.location = Some("Room 5".into());
+
+        assert!(oc.update_event("AAMk-1", &before, &after));
+        assert!(oc.delete_event("AAMk-1"));
+
+        let seen = seen.join().unwrap();
+        assert!(seen[0].starts_with("PATCH /me/events/AAMk-1 HTTP/1.1\r\n"), "{}", seen[0]);
+        assert_eq!(body_of(&seen[0]), json!({ "location": { "displayName": "Room 5" } }));
+        assert!(seen[1].starts_with("DELETE /me/events/AAMk-1 HTTP/1.1\r\n"), "{}", seen[1]);
+    }
 }

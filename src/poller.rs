@@ -393,7 +393,7 @@ fn sync_outlook_calendar(
 /// Write the current access / refresh tokens into the calendar's
 /// `source_config`. Cheap, and safe to call more than once — the tokens
 /// only change when the provider rotates them.
-fn persist_outlook_tokens(
+pub(crate) fn persist_outlook_tokens(
     db: &Database,
     cal_id: i64,
     config: &mut serde_json::Value,

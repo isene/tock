@@ -10,6 +10,17 @@ mod poller;
 mod sources;
 mod weather;
 
+/// What became of sending a saved event to its calendar's server.
+#[derive(PartialEq)]
+enum Push {
+    /// A local calendar: there is no server.
+    Local,
+    Sent,
+    /// The event is saved here and the server does not have it. Holds
+    /// the line to show the user.
+    Failed(String),
+}
+
 use crust::{display_width, strip_ansi, Crust, Cursor, Input, Pane, style};
 use database::{Database, Event, EventData};
 use std::collections::HashMap;
@@ -196,6 +207,86 @@ fn month_short(m: u32) -> &'static str {
 fn format_date_long(y: i32, m: u32, d: u32) -> String {
     let wd = cwday(y, m, d);
     format!("{}, {} {:02}, {}", weekday_long(wd), month_name(m), d, y)
+}
+
+/// The local day an event starts on. An all-day event is stored at
+/// midnight UTC of its day, so it is read without the zone offset.
+fn event_day(evt: &Event) -> (i32, u32, u32) {
+    let tz = if evt.all_day { 0 } else { local_tz_offset_secs() };
+    let (y, m, d, _, _, _) = ts_to_parts(evt.start_time + tz);
+    (y, m, d)
+}
+
+/// One row of the event list: calendar colour, day, start time, title and
+/// place. The day is dimmed when it repeats the row above. The year is
+/// shown when it is not this year.
+fn event_list_line(evt: &Event, selected: bool, same_day: bool, width: usize) -> String {
+    let (y, m, d) = event_day(evt);
+    let mut day = format!("{} {:02} {}", weekday_short(cwday(y, m, d)), d, month_short(m));
+    if y != today().0 {
+        day.push_str(&format!(" {}", y));
+    }
+    let time = if evt.all_day {
+        "all day".to_string()
+    } else {
+        let (_, _, _, h, mi, _) = ts_to_parts(evt.start_time + local_tz_offset_secs());
+        format!("{:02}:{:02}", h, mi)
+    };
+    let mut what = evt.title.clone();
+    if let Some(place) = evt.location.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+        what.push_str(&format!("  ({})", place));
+    }
+    let what = truncate_str(&what, width.saturating_sub(28));
+    let swatch = style::fg("\u{2588}", evt.calendar_color as u8);
+    let day = format!("{:<15}", day);
+    if selected {
+        format!("  {} {}", swatch, style::bold(&style::fg(&format!("{} {:<7}  {}", day, time, what), 39)))
+    } else {
+        let day = if same_day { style::fg(&day, 240) } else { day };
+        format!("  {} {} {:<7}  {}", swatch, day, time, what)
+    }
+}
+
+/// True when every word is in the event's title, place or description.
+/// `words` are lower case.
+fn event_has_words(evt: &Event, words: &[String]) -> bool {
+    let mut text = evt.title.to_lowercase();
+    if let Some(place) = &evt.location {
+        text.push(' ');
+        text.push_str(&place.to_lowercase());
+    }
+    if let Some(desc) = &evt.description {
+        text.push(' ');
+        text.push_str(&plain_lower(desc));
+    }
+    words.iter().all(|w| text.contains(w.as_str()))
+}
+
+/// A description in lower case with its HTML left out: the tags, and the
+/// style sheet Outlook puts in every mail-made event. Without this a
+/// search for "table" or "font" would find every Outlook meeting.
+fn plain_lower(desc: &str) -> String {
+    let mut text = desc.to_lowercase();
+    if !text.contains('<') {
+        return text;
+    }
+    for (open, close) in [("<head", "</head>"), ("<style", "</style>"), ("<!--", "-->")] {
+        while let Some(start) = text.find(open) {
+            let end = text[start..].find(close).map_or(text.len(), |e| start + e + close.len());
+            text.replace_range(start..end, " ");
+        }
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut in_tag = false;
+    for c in text.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' if in_tag => { in_tag = false; out.push(' '); }
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out
 }
 
 fn format_date_short(y: i32, m: u32, d: u32) -> String {
@@ -850,7 +941,7 @@ impl App {
     // ----- Status bar -----
 
     fn render_status_bar(&mut self) {
-        let keys = "d/D:Day  w/W:Week  m/M:Month  y/Y:Year  e/E:Event  n:New  g:GoTo  t:Today  i:Import  G:Google  O:Outlook  K:CalDAV  S:Sync  C:Cal  P:Prefs  ?:Help  q:Quit";
+        let keys = "d/D:Day  w/W:Week  m/M:Month  y/Y:Year  e/E:Event  n:New  g:GoTo  /:Find  L:List  t:Today  i:Import  G:Google  O:Outlook  K:CalDAV  S:Sync  C:Cal  P:Prefs  ?:Help  q:Quit";
         let version = format!("tock v{}", env!("CARGO_PKG_VERSION"));
         let w = self.cols as usize;
         // Right of the keys: the sync in progress, else a calendar that
@@ -1509,6 +1600,8 @@ impl App {
                 self.date_changed();
             }
             "g" => self.go_to_date(),
+            "/" => self.find_events(),
+            "L" => self.show_agenda(),
             "n" => self.create_event(),
             "ENTER" => self.edit_event(),
             "x" | "DEL" => self.delete_event(),
@@ -1606,6 +1699,107 @@ impl App {
         ctx
     }
 
+    /// `L`: the coming 30 days as one list.
+    fn show_agenda(&mut self) {
+        let (y, m, d) = today();
+        let from = date_to_ts(y, m, d, 0, 0, 0) - local_tz_offset_secs();
+        let events = self.db.get_events_in_range(from, from + 30 * 86400).unwrap_or_default();
+        if events.is_empty() {
+            self.show_feedback("Nothing in the next 30 days", 245);
+            return;
+        }
+        self.event_list("The next 30 days", &events, 0);
+    }
+
+    /// `/`: every event with the typed words in its title, place or text.
+    fn find_events(&mut self) {
+        self.blank_bottom("");
+        let input = self.bottom_ask("Find: ", "");
+        let words: Vec<String> = input.split_whitespace().map(str::to_lowercase).collect();
+        if words.is_empty() { self.render_all(); return; }
+        let found: Vec<Event> = self.db.get_events_in_range(0, i64::MAX).unwrap_or_default()
+            .into_iter().filter(|e| event_has_words(e, &words)).collect();
+        if found.is_empty() {
+            self.render_all();
+            self.show_feedback(&format!("No event has \"{}\"", input.trim()), 245);
+            return;
+        }
+        // Start on the first one that is not over yet.
+        let now = database::now_secs();
+        let first = found.iter().position(|e| e.end_time >= now).unwrap_or(found.len() - 1);
+        let title = format!("{} with \"{}\"",
+            if found.len() == 1 { "1 event".to_string() } else { format!("{} events", found.len()) },
+            input.trim());
+        self.event_list(&title, &found, first);
+    }
+
+    /// A list of events in a popup: the agenda and the finds. Enter goes
+    /// to the picked event's day and time.
+    fn event_list(&mut self, title: &str, events: &[Event], first: usize) {
+        if events.is_empty() { return; }
+        let pw = self.cols.saturating_sub(8).clamp(40, 100);
+        let ph = self.rows.saturating_sub(4).max(9);
+        let px = (self.cols.saturating_sub(pw)) / 2;
+        let py = (self.rows.saturating_sub(ph)) / 2;
+        let mut popup = Pane::new(px, py, pw, ph, 252, 0);
+        popup.border = true;
+        popup.scroll = false;
+
+        // Inside the border: an empty line, the title, a rule, the events,
+        // an empty line and the keys.
+        let room = (ph as usize).saturating_sub(5).max(1);
+        let width = (pw as usize).saturating_sub(6).max(1);
+        let last = events.len() - 1;
+        let mut sel = first.min(last);
+        let mut top = 0usize;
+        popup.full_refresh();
+        let picked = loop {
+            if sel < top { top = sel; }
+            if sel >= top + room { top = sel + 1 - room; }
+            let mut lines = vec![
+                String::new(),
+                format!("  {}", style::bold(title)),
+                format!("  {}", style::fg(&"-".repeat(width), 238)),
+            ];
+            for i in top..(top + room).min(events.len()) {
+                let same_day = i > top && event_day(&events[i]) == event_day(&events[i - 1]);
+                lines.push(event_list_line(&events[i], i == sel, same_day, width));
+            }
+            while lines.len() < room + 3 { lines.push(String::new()); }
+            lines.push(String::new());
+            lines.push(format!("  {}", style::fg(
+                &format!("{}/{}  j/k:nav  ENTER:go there  q:close", sel + 1, events.len()), 245)));
+            popup.set_text(&lines.join("\n"));
+            popup.ix = 0;
+            popup.refresh();
+
+            match Input::getchr(None).as_deref() {
+                Some("ESC") | Some("q") => break None,
+                Some("ENTER") => break Some(sel),
+                Some("j") | Some("DOWN") => sel = (sel + 1).min(last),
+                Some("k") | Some("UP") => sel = sel.saturating_sub(1),
+                Some("PgDOWN") => sel = (sel + room).min(last),
+                Some("PgUP") => sel = sel.saturating_sub(room),
+                Some("HOME") => sel = 0,
+                Some("END") => sel = last,
+                _ => {}
+            }
+        };
+
+        Crust::clear_screen();
+        self.recreate_panes();
+        if let Some(i) = picked {
+            let evt = events[i].clone();
+            self.selected_date = event_day(&evt);
+            self.allday_count_date = None;
+            self.load_events_for_range();
+            self.selected_event_index = self.events_on_selected_day().iter()
+                .position(|e| e.id == evt.id).unwrap_or(0);
+            self.move_slot_to_event(&evt);
+        }
+        self.render_all();
+    }
+
     fn go_to_date(&mut self) {
         self.blank_bottom("");
         let input = self.bottom_ask("Go to: ", "");
@@ -1667,31 +1861,33 @@ impl App {
         None
     }
 
-    /// If `cal` is a remote-source calendar (google / outlook), push the
-    /// just-saved event up. For new events (no external_id yet), the
-    /// remote create returns an id which we persist back. Returns true
-    /// when a remote push happened (success or attempted), false when
-    /// the calendar is local-only.
+    /// If `cal` is a remote-source calendar (google / outlook / caldav),
+    /// push the just-saved event up. For new events (no external_id yet),
+    /// the remote create returns an id which we persist back. `before` is
+    /// the event as it was, for an edit. The caller shows a failure, after
+    /// its own redraw, or the redraw would wipe the message out.
     fn push_event_remote(&mut self, cal: &crate::database::Calendar,
-                          local_id: i64, mut data: EventData) -> bool {
+                          local_id: i64, mut data: EventData,
+                          before: Option<&EventData>) -> Push {
+        const NO_SETTINGS: &str = "Saved locally: the calendar has no sign-in data";
         match cal.source_type.as_str() {
             "google" => {
-                let cfg_str = match &cal.source_config { Some(s) => s.clone(), None => return true };
+                let cfg_str = match &cal.source_config {
+                    Some(s) => s.clone(),
+                    None => return Push::Failed(NO_SETTINGS.into()),
+                };
                 let cfg: serde_json::Value = match serde_json::from_str(&cfg_str) {
-                    Ok(v) => v, Err(_) => return true,
+                    Ok(v) => v, Err(_) => return Push::Failed(NO_SETTINGS.into()),
                 };
                 let email = cfg.get("email").and_then(|v| v.as_str()).unwrap_or("");
                 let safe_dir = cfg.get("safe_dir").and_then(|v| v.as_str());
                 let google_cal_id = cfg.get("google_calendar_id").and_then(|v| v.as_str()).unwrap_or("");
                 if email.is_empty() || google_cal_id.is_empty() {
-                    self.show_feedback("Google config incomplete (email/google_calendar_id)",
-                        214);
-                    return true;
+                    return Push::Failed("Google config incomplete (email/google_calendar_id)".into());
                 }
                 let mut gc = crate::sources::google::GoogleCalendar::new(email, safe_dir);
                 if gc.get_access_token().is_none() {
-                    self.show_feedback("Google auth failed - run S to re-auth", 196);
-                    return true;
+                    return Push::Failed("Saved locally: Google auth failed - run S to re-auth".into());
                 }
                 if let Some(ref existing_id) = data.external_id.clone() {
                     // UPDATE existing remote event
@@ -1703,26 +1899,22 @@ impl App {
                         data.external_id = Some(remote_id);
                         let _ = self.db.save_event(&data);
                     } else {
-                        self.show_feedback(
-                            &format!("Saved locally, Google push failed: {}",
-                                gc.last_error.as_deref().unwrap_or("unknown")),
-                            196);
+                        return Push::Failed(format!("Saved locally, Google push failed: {}",
+                            gc.last_error.as_deref().unwrap_or("unknown")));
                     }
                 }
-                true
+                Push::Sent
             }
             "caldav" => {
                 let Some((dav, url, _)) = poller::caldav_for(cal) else {
-                    self.show_feedback("Saved locally; the CalDAV calendar has no password file (K sets it)", 214);
-                    return true;
+                    return Push::Failed("Saved locally; the CalDAV calendar has no password file (K sets it)".into());
                 };
                 let uid = data.metadata.as_ref().and_then(|m| m.get("ics_uid")).and_then(|v| v.as_str())
                     .map(String::from).unwrap_or_else(sources::caldav::new_uid);
                 let ics = sources::caldav::to_ics(&data, &uid);
                 let sent = match data.external_id.clone() {
                     Some(href) if sources::caldav::is_repeat(&href) => {
-                        self.show_feedback("Saved here only: a repeat of a series is changed on the server", 214);
-                        return true;
+                        return Push::Failed("Saved here only: a repeat of a series is changed on the server".into());
                     }
                     Some(href) => dav.put(&href, &ics, false),
                     None => {
@@ -1738,18 +1930,71 @@ impl App {
                     }
                 };
                 if let Err(e) = sent {
-                    self.show_feedback(&format!("Saved locally, CalDAV push failed: {e}"), 196);
+                    return Push::Failed(format!("Saved locally, CalDAV push failed: {e}"));
                 }
-                true
+                Push::Sent
             }
             "outlook" => {
-                // Outlook write-back not yet wired; warn user.
-                self.show_feedback("Saved locally; Outlook write-back not implemented",
-                    214);
-                true
+                let mut oc = match self.outlook_for(cal) {
+                    Ok(oc) => oc,
+                    Err(why) => return Push::Failed(format!("Saved locally: {why}")),
+                };
+                let failed = |oc: &sources::outlook::OutlookCalendar, what: &str| {
+                    Push::Failed(format!("Saved locally, Outlook {what} failed: {}",
+                        oc.last_error.as_deref().unwrap_or("unknown")))
+                };
+                match (data.external_id.clone(), before) {
+                    (Some(id), Some(old)) => {
+                        if !oc.update_event(&id, old, &data) {
+                            return failed(&oc, "update");
+                        }
+                    }
+                    // On the server already, and nothing to compare with.
+                    (Some(_), None) => {}
+                    (None, _) => {
+                        // An imported file may list guests, often of someone
+                        // else's meeting. Outlook mails every guest of a new
+                        // event, so an import goes up without them.
+                        let mut up = data.clone();
+                        let imported = up.metadata.as_ref().is_some_and(|m| m.get("ics_uid").is_some());
+                        if imported {
+                            up.attendees = None;
+                        }
+                        match oc.create_event(&up) {
+                            Some(remote_id) => {
+                                data.id = Some(local_id);
+                                data.external_id = Some(remote_id);
+                                let _ = self.db.save_event(&data);
+                            }
+                            None => return failed(&oc, "push"),
+                        }
+                    }
+                }
+                Push::Sent
             }
-            _ => false, // local calendar - no remote action
+            _ => Push::Local,
         }
+    }
+
+    /// The Outlook client for a calendar, signed in. Microsoft may hand out
+    /// a new refresh token at sign-in and retire the old one, so the new
+    /// pair is written down before any request goes out. The settings are
+    /// read fresh, since the background sync may have renewed them.
+    fn outlook_for(&self, cal: &crate::database::Calendar)
+        -> Result<sources::outlook::OutlookCalendar, String>
+    {
+        let mut config: serde_json::Value = self.db.get_calendars(false).ok()
+            .and_then(|cs| cs.into_iter().find(|c| c.id == cal.id))
+            .and_then(|c| c.source_config)
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .ok_or("the Outlook calendar has no sign-in data (O signs in)")?;
+        let mut oc = sources::outlook::OutlookCalendar::new(&config);
+        if oc.refresh_access_token().is_none() {
+            return Err(format!("Outlook sign-in failed: {} (O signs in again)",
+                oc.last_error.as_deref().unwrap_or("unknown")));
+        }
+        poller::persist_outlook_tokens(&self.db, cal.id, &mut config, &oc);
+        Ok(oc)
     }
 
     /// Push freshly imported events (ICS drop-in or manual import) to their
@@ -1789,36 +2034,49 @@ impl App {
                 alarms: evt.alarms.clone(),
                 metadata: ics_uid.map(|u| serde_json::json!({"ics_uid": u})),
             };
-            self.push_event_remote(&cal, id, data);
+            if let Push::Failed(why) = self.push_event_remote(&cal, id, data, None) {
+                self.show_feedback(&why, 196);
+            }
         }
     }
 
     /// Mirror of push_event_remote for delete: if the calendar is remote
-    /// and we have an external id, delete it on the remote side.
+    /// and we have an external id, delete it on the remote side. Gives
+    /// back the reason when the server still has the event.
     fn delete_event_remote(&mut self, cal: &crate::database::Calendar,
-                            external_id: &str) {
+                            external_id: &str) -> Option<String> {
         match cal.source_type.as_str() {
             "google" => {
-                let cfg_str = match &cal.source_config { Some(s) => s.clone(), None => return };
+                let cfg_str = match &cal.source_config { Some(s) => s.clone(), None => return None };
                 let cfg: serde_json::Value = match serde_json::from_str(&cfg_str) {
-                    Ok(v) => v, Err(_) => return,
+                    Ok(v) => v, Err(_) => return None,
                 };
                 let email = cfg.get("email").and_then(|v| v.as_str()).unwrap_or("");
                 let safe_dir = cfg.get("safe_dir").and_then(|v| v.as_str());
                 let google_cal_id = cfg.get("google_calendar_id").and_then(|v| v.as_str()).unwrap_or("");
-                if email.is_empty() || google_cal_id.is_empty() { return; }
+                if email.is_empty() || google_cal_id.is_empty() { return None; }
                 let mut gc = crate::sources::google::GoogleCalendar::new(email, safe_dir);
-                if gc.get_access_token().is_none() { return; }
+                if gc.get_access_token().is_none() { return None; }
                 let _ = gc.delete_event(google_cal_id, external_id);
+                None
             }
             "caldav" if !sources::caldav::is_repeat(external_id) => {
-                if let Some((dav, _, _)) = poller::caldav_for(cal) {
-                    if let Err(e) = dav.delete(external_id) {
-                        self.show_feedback(&format!("Deleted here; CalDAV delete failed: {e}"), 196);
-                    }
-                }
+                let (dav, _, _) = poller::caldav_for(cal)?;
+                dav.delete(external_id).err()
+                    .map(|e| format!("Deleted here; CalDAV delete failed: {e}"))
             }
-            _ => {}
+            "outlook" => {
+                let mut oc = match self.outlook_for(cal) {
+                    Ok(oc) => oc,
+                    Err(why) => return Some(format!("Deleted here only: {why}")),
+                };
+                if oc.delete_event(external_id) {
+                    return None;
+                }
+                Some(format!("Deleted here; Outlook delete failed: {}",
+                    oc.last_error.as_deref().unwrap_or("unknown")))
+            }
+            _ => None,
         }
     }
 
@@ -1834,7 +2092,7 @@ impl App {
         let default_cal_id = self.config.get_i64("default_calendar", 1);
         let cal = calendars.iter().find(|c| c.id == default_cal_id)
             .or(calendars.first());
-        let cal = match cal {
+        let mut cal = match cal {
             Some(c) => c.clone(),
             None => { self.show_feedback("No calendars configured", 196); return; }
         };
@@ -1853,8 +2111,11 @@ impl App {
             if pick.is_empty() { self.render_all(); return; }
             if let Ok(idx) = pick.trim().parse::<usize>() {
                 if idx >= 1 && idx <= calendars.len() {
-                    cal_id = calendars[idx - 1].id;
-                    cal_color = calendars[idx - 1].color as u8;
+                    // The event is sent to this calendar's server, so the
+                    // whole row follows the pick, not its id alone.
+                    cal = calendars[idx - 1].clone();
+                    cal_id = cal.id;
+                    cal_color = cal.color as u8;
                 }
             }
         }
@@ -1920,6 +2181,19 @@ impl App {
             Some(desc_str.trim().to_string())
         };
 
+        // Outlook can make the event a Teams meeting. `outlook.teams` in
+        // the config sets which answer Enter gives.
+        let mut metadata = None;
+        if cal.source_type == "outlook" {
+            let usual = self.config.get("outlook.teams", serde_yaml::Value::Bool(false))
+                .as_bool().unwrap_or(false);
+            self.blank_bottom(&style::bold(&style::fg(&format!(" {}", title), cal_color)));
+            let teams = self.bottom_ask(" Teams meeting (y/n): ", if usual { "y" } else { "n" });
+            if teams.trim().eq_ignore_ascii_case("y") {
+                metadata = Some(serde_json::json!({ "teams": true }));
+            }
+        }
+
         let data = EventData {
             id: None,
             calendar_id: cal_id,
@@ -1938,7 +2212,7 @@ impl App {
             attendees,
             my_status: None,
             alarms: None,
-            metadata: None,
+            metadata,
         };
 
         let local_id = match self.db.save_event(&data) {
@@ -1949,13 +2223,16 @@ impl App {
             }
         };
 
-        // Push to remote source if applicable (Google / Outlook).
-        let pushed = self.push_event_remote(&cal, local_id, data);
+        // Push to remote source if applicable (Google / Outlook / CalDAV).
+        let pushed = self.push_event_remote(&cal, local_id, data, None);
 
         self.load_events_for_range();
         self.render_all();
-        let suffix = if pushed { " (synced)" } else { "" };
-        self.show_feedback(&format!("Event created: {}{}", title, suffix), cal_color);
+        match pushed {
+            Push::Failed(why) => self.show_feedback(&why, 196),
+            Push::Sent => self.show_feedback(&format!("Event created: {} (synced)", title), cal_color),
+            Push::Local => self.show_feedback(&format!("Event created: {}", title), cal_color),
+        }
     }
 
     fn edit_event(&mut self) {
@@ -1973,6 +2250,12 @@ impl App {
             ts_to_parts(evt.start_time + tz)
         };
         let span_secs = (evt.end_time - evt.start_time).max(0);
+        let cal_opt = self.db.get_calendars(false).ok()
+            .and_then(|cs| cs.into_iter().find(|c| c.id == evt.calendar_id));
+        // An event that Outlook already has keeps the description Outlook
+        // has: on a meeting it holds the Teams join block.
+        let outlook_owns_text = evt.external_id.is_some()
+            && cal_opt.as_ref().is_some_and(|c| c.source_type == "outlook");
 
         // Title
         self.blank_bottom(&style::bold(" Edit Event"));
@@ -2020,12 +2303,7 @@ impl App {
         let location = if loc_in.trim().is_empty() { None } else { Some(loc_in.trim().to_string()) };
 
         // Invitees (prefill from current attendees' emails)
-        let inv_def = evt.attendees.as_ref()
-            .and_then(|a| a.as_array())
-            .map(|arr| arr.iter()
-                .filter_map(|e| e.get("email").and_then(|v| v.as_str()))
-                .collect::<Vec<_>>().join(", "))
-            .unwrap_or_default();
+        let inv_def = sources::outlook::guest_addresses(evt.attendees.as_ref()).join(", ");
         self.blank_bottom(&style::bold(&format!(" {} — invitees", new_title)));
         let inv_in = self.bottom_ask(" Invite (comma emails, Enter to skip): ", &inv_def);
         let attendees = if inv_in.trim().is_empty() { None } else {
@@ -2036,10 +2314,14 @@ impl App {
         };
 
         // Description
-        let desc_def = evt.description.clone().unwrap_or_default();
-        self.blank_bottom(&style::bold(&format!(" {} — description", new_title)));
-        let desc_in = self.bottom_ask(" Description (Enter to skip): ", &desc_def);
-        let description = if desc_in.trim().is_empty() { None } else { Some(desc_in.trim().to_string()) };
+        let description = if outlook_owns_text {
+            evt.description.clone()
+        } else {
+            let desc_def = evt.description.clone().unwrap_or_default();
+            self.blank_bottom(&style::bold(&format!(" {} — description", new_title)));
+            let desc_in = self.bottom_ask(" Description (Enter to skip): ", &desc_def);
+            if desc_in.trim().is_empty() { None } else { Some(desc_in.trim().to_string()) }
+        };
 
         let data = EventData {
             id: Some(evt.id),
@@ -2071,16 +2353,18 @@ impl App {
         };
 
         // Push update to remote if the calendar is a remote source.
-        let cal_opt = self.db.get_calendars(false).ok()
-            .and_then(|cs| cs.into_iter().find(|c| c.id == evt.calendar_id));
-        let pushed = if let Some(cal) = cal_opt {
-            self.push_event_remote(&cal, local_id, data)
-        } else { false };
+        let pushed = match cal_opt {
+            Some(cal) => self.push_event_remote(&cal, local_id, data, Some(&evt.data())),
+            None => Push::Local,
+        };
 
         self.load_events_for_range();
         self.render_all();
-        let suffix = if pushed { " (synced)" } else { "" };
-        self.show_feedback(&format!("Event updated{}", suffix), 156);
+        match pushed {
+            Push::Failed(why) => self.show_feedback(&why, 196),
+            Push::Sent => self.show_feedback("Event updated (synced)", 156),
+            Push::Local => self.show_feedback("Event updated", 156),
+        }
     }
 
     fn delete_event(&mut self) {
@@ -2125,20 +2409,33 @@ impl App {
             return;
         }
 
-        let confirm = self.bottom_ask(&format!(" Delete '{}'? (y/n): ", evt.title), "");
+        let cal_opt = self.db.get_calendars(false).ok()
+            .and_then(|cs| cs.into_iter().find(|c| c.id == evt.calendar_id));
+        // Outlook mails a cancellation to the guests of a meeting you made.
+        let tells_guests = evt.external_id.is_some()
+            && cal_opt.as_ref().is_some_and(|c| c.source_type == "outlook")
+            && !sources::outlook::guest_addresses(evt.attendees.as_ref()).is_empty();
+        let question = if tells_guests {
+            format!(" Delete '{}'? Outlook tells the guests (y/n): ", evt.title)
+        } else {
+            format!(" Delete '{}'? (y/n): ", evt.title)
+        };
+        let confirm = self.bottom_ask(&question, "");
         if confirm.trim().to_lowercase() != "y" { self.render_all(); return; }
 
         // Push delete to remote first (before we lose the external_id).
-        let cal_opt = self.db.get_calendars(false).ok()
-            .and_then(|cs| cs.into_iter().find(|c| c.id == evt.calendar_id));
+        let mut failed = None;
         if let (Some(cal), Some(ref ext)) = (cal_opt, evt.external_id.as_ref()) {
-            self.delete_event_remote(&cal, ext);
+            failed = self.delete_event_remote(&cal, ext);
         }
 
         let _ = self.db.delete_event(evt.id);
         self.load_events_for_range();
         self.render_all();
-        self.show_feedback("Event deleted", 156);
+        match failed {
+            Some(why) => self.show_feedback(&why, 196),
+            None => self.show_feedback("Event deleted", 156),
+        }
     }
 
     fn copy_event_to_clipboard(&mut self) {
@@ -3380,7 +3677,8 @@ impl App {
 
     fn show_help(&mut self) {
         let pw = (self.cols.saturating_sub(16) as usize).min(68).max(56) as u16;
-        let ph = 24u16;
+        // One row for each line pushed below.
+        let ph = 27u16.min(self.rows.saturating_sub(2));
         let px = (self.cols.saturating_sub(pw)) / 2;
         let py = (self.rows.saturating_sub(ph)) / 2;
 
@@ -3407,6 +3705,7 @@ impl App {
         lines.push(format!("  {}      {}  {}     {}", k("END"), d("Bottom (23:30)"), k("j/k"), d("Cycle events")));
         lines.push(format!("  {}      {}", k("e/E"), d("Jump to event (next/prev)")));
         lines.push(format!("  {}        {}           {}       {}", k("t"), d("Today"), k("g"), d("Go to (date, Mon, yyyy)")));
+        lines.push(format!("  {}        {}   {}       {}", k("/"), d("Find an event"), k("L"), d("List the next 30 days")));
         lines.push(sep.clone());
         lines.push(format!("  {}", style::bold(&style::fg("Events", 156))));
         lines.push(format!("  {}        {}       {}   {}", k("n"), d("New event"), k("ENTER"), d("Edit event")));
@@ -4157,6 +4456,42 @@ mod tests {
             attendees: None, my_status: None, alarms: None, metadata: None,
             calendar_name: String::new(), calendar_color: 0,
         }
+    }
+
+    #[test]
+    fn find_reads_the_title_the_place_and_the_text_but_no_html() {
+        let words = |typed: &str| -> Vec<String> { typed.split_whitespace().map(str::to_lowercase).collect() };
+        let mut lunch = ev(1, 0, 3600);
+        lunch.title = "Lunch with Alice".into();
+        lunch.location = Some("The Harbour Café".into());
+        lunch.description = Some(
+            "<html><head><style>p { font-family: Calibri; }</style></head>\
+             <body><p class=\"note\">Bring the <b>budget</b> sheet</p></body></html>".into());
+
+        assert!(event_has_words(&lunch, &words("alice")));
+        assert!(event_has_words(&lunch, &words("LUNCH harbour")), "every word, in any order and case");
+        assert!(event_has_words(&lunch, &words("budget café")));
+        assert!(!event_has_words(&lunch, &words("alice dinner")), "one missing word is no find");
+        // Words that are in the HTML alone: a tag, a class, the style sheet.
+        for html_only in ["body", "note", "calibri", "font-family"] {
+            assert!(!event_has_words(&lunch, &words(html_only)), "{html_only} is markup, not text");
+        }
+        // A plain description with a < in it keeps what comes before.
+        lunch.description = Some("Speed < 5 knots in the harbour".into());
+        assert!(event_has_words(&lunch, &words("speed")));
+    }
+
+    #[test]
+    fn a_list_row_shows_the_day_the_hour_and_the_place() {
+        // 2026-10-12 is a Monday; an all-day event sits at midnight UTC.
+        let mut trip = ev(1, date_to_ts(2026, 10, 12, 0, 0, 0), date_to_ts(2026, 10, 13, 0, 0, 0));
+        trip.all_day = true;
+        trip.title = "Trip".into();
+        trip.location = Some("Bergen".into());
+        assert_eq!(event_day(&trip), (2026, 10, 12));
+        let row = strip_ansi(&event_list_line(&trip, false, false, 80));
+        assert!(row.contains("Mon 12 Oct"), "{row}");
+        assert!(row.contains("all day  Trip  (Bergen)"), "{row}");
     }
 
     #[test]
