@@ -52,6 +52,7 @@ google:
 outlook:
   client_id: ''
   tenant_id: common
+  teams: false
 notifications:
   enabled: true
   default_alarm: 15

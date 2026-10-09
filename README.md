@@ -26,7 +26,9 @@ Terminal calendar with week view, event management, astronomy, and weather. Buil
   - Solstices, equinoxes, 11 meteor shower peaks
 - **Weather**: 7-day forecast from Met.no (free, no API key)
 - **Desktop notifications**: configurable alarms via notify-send
-- **Event management**: create, edit, delete, accept invites (RSVP)
+- **Event management**: create, edit, delete, accept invites (RSVP). A change on a Google, Outlook or CalDAV calendar goes to its server
+- **Find**: `/` lists every event with the typed words in its title, place or description
+- **Agenda**: `L` lists the coming 30 days; Enter goes to the picked event
 - **Preferences**: 15 configurable settings with inline color picker (256-color grid)
 - **Calendar manager**: enable/disable calendars, change colors, remove
 - **Kastrup integration**: reply to events via Kastrup (r key), jump to Kastrup (Z key)
@@ -56,6 +58,8 @@ cp target/release/tock ~/.local/bin/
 | e/E | Jump to next/prev event |
 | t | Go to today |
 | g | Go to date |
+| / | Find events by words; Enter goes to the picked one |
+| L | List the coming 30 days |
 | n | New event |
 | Enter | Edit event |
 | x/DEL | Delete event |
@@ -145,6 +149,18 @@ Outlook needs none of this: `O` runs the whole device-code flow. A company
 sign-in policy can expire that sign-in after some weeks; tock then shows a red
 ⚠ line in the status bar and `S` says which calendar it is. Press `O` and sign
 in again; the calendar and its events stay as they are.
+
+An event you make, edit or delete on an Outlook calendar goes to Outlook.
+
+- Outlook mails the invitation to every guest at once, and a cancellation
+  when you delete a meeting you made.
+- tock asks whether a new event is a Teams meeting. `teams: true` under
+  `outlook:` in the config makes yes the answer Enter gives.
+- An edit sends the title, the time, the place and the guests. The
+  description stays as Outlook has it, since it carries the Teams link.
+- A guest list you empty is not sent; take the last guest off in Outlook.
+- An imported `.ics` goes up without its guests, so nobody gets mail for a
+  meeting that was not yours to call.
 
 ## Dependencies
 

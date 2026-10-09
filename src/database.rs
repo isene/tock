@@ -42,6 +42,32 @@ pub struct Event {
     pub calendar_color: i64,
 }
 
+impl Event {
+    /// The event as the shape that gets saved and sent to a server.
+    pub fn data(&self) -> EventData {
+        EventData {
+            id: Some(self.id),
+            calendar_id: self.calendar_id,
+            external_id: self.external_id.clone(),
+            title: self.title.clone(),
+            description: self.description.clone(),
+            location: self.location.clone(),
+            start_time: self.start_time,
+            end_time: self.end_time,
+            all_day: self.all_day,
+            timezone: self.timezone.clone(),
+            recurrence_rule: self.recurrence_rule.clone(),
+            series_master_id: self.series_master_id,
+            status: self.status.clone(),
+            organizer: self.organizer.clone(),
+            attendees: self.attendees.clone(),
+            my_status: self.my_status.clone(),
+            alarms: self.alarms.clone(),
+            metadata: self.metadata.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Calendar {
     pub id: i64,
