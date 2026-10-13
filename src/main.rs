@@ -181,6 +181,12 @@ fn from_local(local: i64) -> i64 {
     local - tz_offset_at(local - tz_offset_at(local))
 }
 
+/// Hours from UTC for a day's sun, moon and planet times: the offset at
+/// that day's noon, so the times follow summer time.
+fn sky_tz(year: i32, month: u32, day: u32) -> f64 {
+    tz_offset_at(date_to_ts(year, month, day, 12, 0, 0)) as f64 / 3600.0
+}
+
 /// Format a weekday name from ISO weekday number
 fn weekday_short(wd: u32) -> &'static str {
     match wd {
@@ -880,7 +886,7 @@ impl App {
 
         let lat = self.config.get_f64("location.lat", 59.9139);
         let lon = self.config.get_f64("location.lon", 10.7522);
-        let tz = self.config.get_f64("timezone_offset", 1.0);
+        let tz = sky_tz(sy, sm, sd);
 
         // Harmonised header pattern: `<body glyph> <up/down arrow>
         // <time>` for sun AND moon, so both rise/set pairs read the
@@ -4454,6 +4460,21 @@ mod tests {
             let (_, _, _, h, _, _) = ts_to_parts(to_local(ts));
             assert_eq!(h, libc_hour);
             assert_eq!(from_local(to_local(ts)), ts);
+        }
+    }
+
+    #[test]
+    fn sun_and_moon_times_use_the_offset_of_their_own_day() {
+        // A fixed offset is wrong for one of these two days wherever the
+        // clock changes for summer, and wrong for both on a UTC machine.
+        for (y, m, d) in [(2027, 1, 15), (2026, 7, 15)] {
+            let libc_hour = unsafe {
+                let t = date_to_ts(y, m, d, 12, 0, 0) as libc::time_t;
+                let mut tm: libc::tm = std::mem::zeroed();
+                libc::localtime_r(&t, &mut tm);
+                tm.tm_hour as f64 + tm.tm_min as f64 / 60.0
+            };
+            assert_eq!((12.0 + sky_tz(y, m, d)).rem_euclid(24.0), libc_hour);
         }
     }
 

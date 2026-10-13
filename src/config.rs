@@ -40,7 +40,6 @@ location:
   lat: 59.9139
   lon: 10.7522
 timezone: Europe/Oslo
-timezone_offset: 1
 default_view: month
 work_hours:
   start: 8
