@@ -151,6 +151,14 @@ fn today() -> (i32, u32, u32) {
     (y, m, d)
 }
 
+/// The first row of the grid after a jump to row `slot`, with `rows` rows
+/// to show (a row is half an hour). The work day's start goes at the top
+/// while `slot` still shows below it, so a morning meeting is not left
+/// above the screen in the afternoon. Else `slot` gets five rows above it.
+fn first_row(slot: i32, work: i32, rows: i32) -> i32 {
+    if slot >= work && slot - work < rows - 2 { work } else { (slot - 5).max(0) }
+}
+
 fn now_slot() -> i32 {
     let now = database::now_secs();
     let local = to_local(now);
@@ -321,6 +329,9 @@ struct App {
     selected_date: (i32, u32, u32),
     selected_slot: i32,
     slot_offset: i32,
+    /// Set by a jump (to now, to an event): the next drawing of the grid
+    /// picks its first row by `first_row`. Scrolling by hand leaves it off.
+    follow: bool,
     selected_event_index: usize,
     events_by_date: HashMap<(i32, u32, u32), Vec<Event>>,
     weather_forecast: HashMap<String, weather::DayForecast>,
@@ -407,7 +418,8 @@ impl App {
             running: true,
             selected_date: today(),
             selected_slot: slot,
-            slot_offset: (slot - 5).max(0),
+            slot_offset: 0,
+            follow: true,
             selected_event_index: 0,
             events_by_date: HashMap::new(),
             weather_forecast: HashMap::new(),
@@ -594,7 +606,7 @@ impl App {
             } else {
                 self.selected_slot = now_slot();
             }
-            self.slot_offset = (self.selected_slot - 5).max(0);
+            self.follow = true;
         }
         self.render_all();
     }
@@ -674,7 +686,7 @@ impl App {
             let local = to_local(evt.start_time);
             let (_, _, _, h, m, _) = ts_to_parts(local);
             self.selected_slot = h as i32 * 2 + if m >= 30 { 1 } else { 0 };
-            self.slot_offset = (self.selected_slot - 5).max(0);
+            self.follow = true;
         }
     }
 
@@ -1280,9 +1292,13 @@ impl App {
         }
 
         // Time grid
-        let _work_start = self.config.get_i64("work_hours.start", 8) as i32;
+        let work_start = self.config.get_i64("work_hours.start", 8) as i32;
         let extra_rows = if max_allday > 0 { max_allday + 1 } else { 0 };
         let available = (self.mid.h as i32 - 3 - extra_rows as i32).max(1);
+        if self.follow {
+            self.follow = false;
+            self.slot_offset = first_row(self.selected_slot, work_start * 2, available);
+        }
 
         // Default offset
         if self.slot_offset < 0 { self.slot_offset = 0; }
@@ -1615,7 +1631,7 @@ impl App {
                 self.selected_date = today();
                 self.selected_event_index = 0;
                 self.selected_slot = now_slot();
-                self.slot_offset = (self.selected_slot - 5).max(0);
+                self.follow = true;
                 self.date_changed();
             }
             "g" => self.go_to_date(),
@@ -4453,6 +4469,19 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_grid_keeps_the_morning_in_view() {
+        // 15:30 with 30 rows: the grid starts at 08:00, not at 09:00, so
+        // a meeting at 08:15 the next day is on screen.
+        assert_eq!(first_row(31, 16, 30), 16);
+        assert_eq!(first_row(16, 16, 30), 16);
+        // 20:00 on a short screen: 08:00 would push now off the bottom.
+        assert_eq!(first_row(40, 16, 20), 35);
+        // Before the work day, and in the all-day rows above the grid.
+        assert_eq!(first_row(10, 16, 30), 5);
+        assert_eq!(first_row(-1, 16, 30), 0);
+    }
 
     #[test]
     fn local_time_uses_the_offset_of_the_event_day_not_of_today() {
