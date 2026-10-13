@@ -67,9 +67,10 @@ fn send_notification(title: &str, start_time: i64, location: Option<&str>) {
     let now = now_secs();
     let minutes = (start_time - now) / 60;
 
-    // Format the start time as HH:MM.
-    let hh = ((start_time % 86400) / 3600) % 24;
-    let mm = (start_time % 3600) / 60;
+    // Format the start time as local HH:MM.
+    let local = crate::to_local(start_time);
+    let hh = local.rem_euclid(86400) / 3600;
+    let mm = local.rem_euclid(3600) / 60;
     let time_str = format!("{:02}:{:02}", hh, mm);
 
     let mut body = if minutes <= 1 {

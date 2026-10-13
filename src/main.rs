@@ -146,29 +146,39 @@ fn ts_to_parts(ts: i64) -> (i32, u32, u32, u32, u32, u32) {
 
 fn today() -> (i32, u32, u32) {
     let now = database::now_secs();
-    // Apply local timezone offset
-    let tz_offset = local_tz_offset_secs();
-    let local = now + tz_offset;
+    let local = to_local(now);
     let (y, m, d, _, _, _) = ts_to_parts(local);
     (y, m, d)
 }
 
 fn now_slot() -> i32 {
     let now = database::now_secs();
-    let tz_offset = local_tz_offset_secs();
-    let local = now + tz_offset;
+    let local = to_local(now);
     let (_, _, _, h, m, _) = ts_to_parts(local);
     (h * 2 + if m >= 30 { 1 } else { 0 }) as i32
 }
 
-/// Get local timezone offset in seconds from UTC via libc
-fn local_tz_offset_secs() -> i64 {
+/// Local timezone offset in seconds from UTC at the moment `ts`, via libc.
+/// Ask per timestamp: the offset changes with summer time, so today's
+/// offset is one hour wrong for an event on the far side of a clock change.
+fn tz_offset_at(ts: i64) -> i64 {
     unsafe {
-        let now = database::now_secs() as libc::time_t;
+        let t = ts as libc::time_t;
         let mut tm: libc::tm = std::mem::zeroed();
-        libc::localtime_r(&now, &mut tm);
+        libc::localtime_r(&t, &mut tm);
         tm.tm_gmtoff as i64
     }
+}
+
+/// UTC seconds to local wall-clock seconds, the form `ts_to_parts` reads.
+fn to_local(ts: i64) -> i64 {
+    ts + tz_offset_at(ts)
+}
+
+/// Local wall-clock seconds (as `date_to_ts` builds them) to UTC seconds.
+/// The second lookup settles the hours next to a clock change.
+fn from_local(local: i64) -> i64 {
+    local - tz_offset_at(local - tz_offset_at(local))
 }
 
 /// Format a weekday name from ISO weekday number
@@ -212,8 +222,8 @@ fn format_date_long(y: i32, m: u32, d: u32) -> String {
 /// The local day an event starts on. An all-day event is stored at
 /// midnight UTC of its day, so it is read without the zone offset.
 fn event_day(evt: &Event) -> (i32, u32, u32) {
-    let tz = if evt.all_day { 0 } else { local_tz_offset_secs() };
-    let (y, m, d, _, _, _) = ts_to_parts(evt.start_time + tz);
+    let start = if evt.all_day { evt.start_time } else { to_local(evt.start_time) };
+    let (y, m, d, _, _, _) = ts_to_parts(start);
     (y, m, d)
 }
 
@@ -229,7 +239,7 @@ fn event_list_line(evt: &Event, selected: bool, same_day: bool, width: usize) ->
     let time = if evt.all_day {
         "all day".to_string()
     } else {
-        let (_, _, _, h, mi, _) = ts_to_parts(evt.start_time + local_tz_offset_secs());
+        let (_, _, _, h, mi, _) = ts_to_parts(to_local(evt.start_time));
         format!("{:02}:{:02}", h, mi)
     };
     let mut what = evt.title.clone();
@@ -563,8 +573,7 @@ impl App {
         if self.selected_slot < 0 && self.event_at_selected_slot().is_none() {
             let events = self.events_on_selected_day();
             if let Some(first_timed) = events.iter().find(|e| !e.all_day) {
-                let tz = local_tz_offset_secs();
-                let local = first_timed.start_time + tz;
+                let local = to_local(first_timed.start_time);
                 let (_, _, _, h, m, _) = ts_to_parts(local);
                 self.selected_slot = h as i32 * 2 + if m >= 30 { 1 } else { 0 };
             } else {
@@ -601,8 +610,7 @@ impl App {
         let hour = self.selected_slot / 2;
         let minute = (self.selected_slot % 2) * 30;
         let (sy, sm, sd) = self.selected_date;
-        let tz = local_tz_offset_secs();
-        let slot_start = date_to_ts(sy, sm, sd, hour as u32, minute as u32, 0) - tz;
+        let slot_start = from_local(date_to_ts(sy, sm, sd, hour as u32, minute as u32, 0));
         let slot_end = slot_start + 1800;
 
         let overlaps = |e: &Event| !e.all_day && e.start_time < slot_end && e.end_time > slot_start;
@@ -648,8 +656,7 @@ impl App {
             let idx = allday.iter().position(|e| e.id == evt.id).unwrap_or(0);
             self.selected_slot = -(ac as i32 - idx as i32);
         } else {
-            let tz = local_tz_offset_secs();
-            let local = evt.start_time + tz;
+            let local = to_local(evt.start_time);
             let (_, _, _, h, m, _) = ts_to_parts(local);
             self.selected_slot = h as i32 * 2 + if m >= 30 { 1 } else { 0 };
             self.slot_offset = (self.selected_slot - 5).max(0);
@@ -748,9 +755,8 @@ impl App {
         let range_end_m = add_months((sy, sm, 1), 3);
         let range_end = (range_end_m.0, range_end_m.1, days_in_month(range_end_m.0, range_end_m.1));
 
-        let tz = local_tz_offset_secs();
-        let start_ts = date_to_ts(range_start.0, range_start.1, range_start.2, 0, 0, 0) - tz;
-        let end_ts = date_to_ts(range_end.0, range_end.1, range_end.2, 23, 59, 59) - tz;
+        let start_ts = from_local(date_to_ts(range_start.0, range_start.1, range_start.2, 0, 0, 0));
+        let end_ts = from_local(date_to_ts(range_end.0, range_end.1, range_end.2, 23, 59, 59));
 
         let raw_events = self.db.get_events_in_range(start_ts, end_ts).unwrap_or_default();
 
@@ -764,7 +770,7 @@ impl App {
                 let (y, m, d, _, _, _) = ts_to_parts(evt.start_time);
                 (y, m, d)
             } else {
-                let (y, m, d, _, _, _) = ts_to_parts(evt.start_time + tz);
+                let (y, m, d, _, _, _) = ts_to_parts(to_local(evt.start_time));
                 (y, m, d)
             };
             let (ey, em, ed) = if evt.all_day {
@@ -774,7 +780,7 @@ impl App {
                 let (y, m, d, _, _, _) = ts_to_parts(end_ts);
                 (y, m, d)
             } else {
-                let (y, m, d, _, _, _) = ts_to_parts(evt.end_time + tz);
+                let (y, m, d, _, _, _) = ts_to_parts(to_local(evt.end_time));
                 (y, m, d)
             };
 
@@ -1134,7 +1140,6 @@ impl App {
         let sat_color = self.config.get_i64("colors.saturday", 208) as u8;
         let sun_color = self.config.get_i64("colors.sunday", 167) as u8;
         let t = today();
-        let tz = local_tz_offset_secs();
 
         let mut lines: Vec<String> = Vec::new();
 
@@ -1202,7 +1207,7 @@ impl App {
 
         let week_lanes: Vec<Vec<(usize, usize)>> = (0..7).map(|i| {
             let day = add_days(week_start, i);
-            let day_start = date_to_ts(day.0, day.1, day.2, 0, 0, 0) - tz;
+            let day_start = from_local(date_to_ts(day.0, day.1, day.2, 0, 0, 0));
             assign_lanes(&week_events[i as usize], day_start)
         }).collect();
 
@@ -1301,8 +1306,8 @@ impl App {
                     row_bg
                 };
 
-                let day_ts_start = date_to_ts(day.0, day.1, day.2,
-                    hour as u32, minute as u32, 0) - tz;
+                let day_ts_start = from_local(date_to_ts(day.0, day.1, day.2,
+                    hour as u32, minute as u32, 0));
                 let day_ts_end = day_ts_start + 1800;
 
                 let day_events = &week_events[col as usize];
@@ -1378,7 +1383,7 @@ impl App {
                             // last slot of a multi-slot event adds the
                             // end time (e.g. "▕ -15:30").
                             let tail = if ends_here {
-                                let end_local = evt.end_time + tz;
+                                let end_local = to_local(evt.end_time);
                                 let hh = ((end_local.rem_euclid(86400)) / 3600) as i32;
                                 let mm = ((end_local.rem_euclid(3600)) / 60) as i32;
                                 format!(" -{:02}:{:02}", hh, mm)
@@ -1431,7 +1436,6 @@ impl App {
             // Attendees / Calendar / Status / Join), then the human part of
             // the description with meeting boilerplate stripped out.
             let color = evt.calendar_color as u8;
-            let tz = local_tz_offset_secs();
             const LBL: u8 = 73;   // field label (teal)
             const VAL: u8 = 252;  // primary value
             const DIM: u8 = 245;  // secondary value
@@ -1450,8 +1454,8 @@ impl App {
             let when = if evt.all_day {
                 format!("{}-{:02}-{:02}  All day", sy, sm, sd)
             } else {
-                let (_, _, _, sh, smn, _) = ts_to_parts(evt.start_time + tz);
-                let (_, _, _, eh, emn, _) = ts_to_parts(evt.end_time + tz);
+                let (_, _, _, sh, smn, _) = ts_to_parts(to_local(evt.start_time));
+                let (_, _, _, eh, emn, _) = ts_to_parts(to_local(evt.end_time));
                 format!("{} {}-{:02}-{:02}  {:02}:{:02} - {:02}:{:02}",
                     weekday_short(cwday(sy, sm, sd)), sy, sm, sd, sh, smn, eh, emn)
             };
@@ -1669,7 +1673,6 @@ impl App {
             ctx.push_str(&crust::strip_ansi(p.text()));
             ctx.push('\n');
         }
-        let tz = local_tz_offset_secs();
         ctx.push_str("\nThe selected day and the six after it:\n");
         for i in 0..7 {
             let day = add_days(self.selected_date, i);
@@ -1682,8 +1685,8 @@ impl App {
                 let when = if e.all_day {
                     "all day".to_string()
                 } else {
-                    let (_, _, _, h1, m1, _) = ts_to_parts(e.start_time + tz);
-                    let (_, _, _, h2, m2, _) = ts_to_parts(e.end_time + tz);
+                    let (_, _, _, h1, m1, _) = ts_to_parts(to_local(e.start_time));
+                    let (_, _, _, h2, m2, _) = ts_to_parts(to_local(e.end_time));
                     format!("{h1:02}:{m1:02}-{h2:02}:{m2:02}")
                 };
                 ctx.push_str(&format!("  {when}  {} ({})", e.title, e.calendar_name));
@@ -1702,7 +1705,7 @@ impl App {
     /// `L`: the coming 30 days as one list.
     fn show_agenda(&mut self) {
         let (y, m, d) = today();
-        let from = date_to_ts(y, m, d, 0, 0, 0) - local_tz_offset_secs();
+        let from = from_local(date_to_ts(y, m, d, 0, 0, 0));
         let events = self.db.get_events_in_range(from, from + 30 * 86400).unwrap_or_default();
         if events.is_empty() {
             self.show_feedback("Nothing in the next 30 days", 245);
@@ -2131,7 +2134,6 @@ impl App {
         if time_str.is_empty() { self.render_all(); return; }
 
         let all_day = time_str.trim().to_lowercase() == "all day";
-        let tz = local_tz_offset_secs();
 
         let (start_ts, end_ts) = if all_day {
             // Multi-day all-day: ask how many whole days it spans.
@@ -2145,7 +2147,7 @@ impl App {
             let parts: Vec<&str> = time_str.trim().split(':').collect();
             let hour: u32 = parts.first().and_then(|p| p.parse().ok()).unwrap_or(9);
             let minute: u32 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(0);
-            let s = date_to_ts(sy, sm, sd, hour, minute, 0) - tz;
+            let s = from_local(date_to_ts(sy, sm, sd, hour, minute, 0));
 
             self.blank_bottom(&style::bold(&style::fg(
                 &format!(" {} at {}", title, time_str.trim()), cal_color)));
@@ -2240,14 +2242,13 @@ impl App {
             Some(e) => e,
             None => { self.show_feedback("No event at this time slot", 245); return; }
         };
-        let tz = local_tz_offset_secs();
 
         // Current date/time of the event for prefills: UTC date for
         // all-day (matches storage), local wall-clock for timed.
         let (cy, cm, cd, csh, csmn, _) = if evt.all_day {
             ts_to_parts(evt.start_time)
         } else {
-            ts_to_parts(evt.start_time + tz)
+            ts_to_parts(to_local(evt.start_time))
         };
         let span_secs = (evt.end_time - evt.start_time).max(0);
         let cal_opt = self.db.get_calendars(false).ok()
@@ -2288,7 +2289,7 @@ impl App {
             let parts: Vec<&str> = time_str.trim().split(':').collect();
             let hour: u32 = parts.first().and_then(|p| p.parse().ok()).unwrap_or(9);
             let minute: u32 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(0);
-            let s = date_to_ts(dy, dm, dd, hour, minute, 0) - tz;
+            let s = from_local(date_to_ts(dy, dm, dd, hour, minute, 0));
             let cur_dur = if evt.all_day || span_secs == 0 { 60 } else { (span_secs / 60).max(1) };
             self.blank_bottom(&style::bold(&format!(" {} at {}", new_title, time_str.trim())));
             let dur_str = self.bottom_ask(" Duration in minutes: ", &cur_dur.to_string());
@@ -2445,16 +2446,15 @@ impl App {
         };
 
         let (sy, sm, sd) = self.selected_date;
-        let tz = local_tz_offset_secs();
         let mut text_lines: Vec<String> = Vec::new();
         text_lines.push(evt.title.clone());
 
         if evt.all_day {
             text_lines.push(format!("{}  All day", format_date_long(sy, sm, sd)));
         } else {
-            let local_s = evt.start_time + tz;
+            let local_s = to_local(evt.start_time);
             let (_, _, _, sh, smn, _) = ts_to_parts(local_s);
-            let local_e = evt.end_time + tz;
+            let local_e = to_local(evt.end_time);
             let (_, _, _, eh, emn, _) = ts_to_parts(local_e);
             text_lines.push(format!("{}  {:02}:{:02} - {:02}:{:02}",
                 format_date_long(sy, sm, sd), sh, smn, eh, emn));
@@ -2501,7 +2501,6 @@ impl App {
 
         let (sy, sm, sd) = self.selected_date;
         let color = evt.calendar_color as u8;
-        let tz = local_tz_offset_secs();
         let mut lines: Vec<String> = Vec::new();
 
         lines.push(String::new());
@@ -2514,9 +2513,9 @@ impl App {
             lines.push(format!("  {}  {}  All day",
                 when_label, format_date_long(sy, sm, sd)));
         } else {
-            let local_s = evt.start_time + tz;
+            let local_s = to_local(evt.start_time);
             let (_, _, _, sh, smn, _) = ts_to_parts(local_s);
-            let local_e = evt.end_time + tz;
+            let local_e = to_local(evt.end_time);
             let (_, _, _, eh, emn, _) = ts_to_parts(local_e);
             lines.push(format!("  {}      {}  {:02}:{:02} - {:02}:{:02}",
                 when_label, format_date_long(sy, sm, sd), sh, smn, eh, emn));
@@ -4439,6 +4438,24 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_time_uses_the_offset_of_the_event_day_not_of_today() {
+        // Noon UTC in January and in July. Where the clock changes for
+        // summer, the two have different offsets, so one is never today's.
+        for ts in [date_to_ts(2027, 1, 15, 12, 0, 0), date_to_ts(2026, 7, 15, 12, 0, 0)] {
+            // libc's own local hour, read from tm_hour and not tm_gmtoff.
+            let libc_hour = unsafe {
+                let t = ts as libc::time_t;
+                let mut tm: libc::tm = std::mem::zeroed();
+                libc::localtime_r(&t, &mut tm);
+                tm.tm_hour as u32
+            };
+            let (_, _, _, h, _, _) = ts_to_parts(to_local(ts));
+            assert_eq!(h, libc_hour);
+            assert_eq!(from_local(to_local(ts)), ts);
+        }
+    }
 
     #[test]
     fn the_default_browser_comes_from_default_applications() {
