@@ -352,7 +352,16 @@ struct App {
 
 impl App {
     fn new() -> Self {
-        let db = Arc::new(Database::new(None).expect("Failed to open database"));
+        let db = match Database::new(None) {
+            Ok(db) => Arc::new(db),
+            Err(e) => {
+                // Most often a second tock: ferrite gives its files to
+                // one program at a time.
+                Crust::cleanup();
+                eprintln!("tock: could not open its database: {e}");
+                std::process::exit(1);
+            }
+        };
         let cfg = config::Config::new();
         let (cols, rows) = Crust::terminal_size();
 
