@@ -132,7 +132,7 @@ checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
 name = "fe2o3-crust"
-version = "0.1.62"
+version = "0.1.63"
 dependencies = [
  "crossterm",
  "libc",
@@ -141,7 +141,7 @@ dependencies = [
 
 [[package]]
 name = "fe2o3-ferrite"
-version = "0.1.2"
+version = "0.2.0"
 
 [[package]]
 name = "fe2o3-orbit"
