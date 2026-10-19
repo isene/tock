@@ -32,7 +32,7 @@ Terminal calendar with week view, event management, astronomy, and weather. Buil
 - **Preferences**: 15 configurable settings with inline color picker (256-color grid)
 - **Calendar manager**: enable/disable calendars, change colors, remove
 - **Kastrup integration**: reply to events via Kastrup (r key), jump to Kastrup (Z key)
-- **Database**: [ferrite](https://github.com/isene/ferrite) in ~/.tock/tock.ferrite/, or SQLite with `database: sqlite` in the config
+- **Database**: [ferrite](https://github.com/isene/ferrite) in ~/.tock/tock.ferrite/
 
 ## Install
 
@@ -89,10 +89,13 @@ tock keeps its calendars in [ferrite](https://github.com/isene/ferrite),
 the Fe₂O₃ database that keeps its tables in memory. Every commit is forced
 to the disk before it returns.
 
-Coming from a tock that used SQLite? The first start copies everything out
-of `tock.db` into `~/.tock/tock.ferrite/` and leaves the SQLite file as it
-was. `database: sqlite` in the config takes you back to the data as of
-that copy.
+Only one program may open the database, so tock also writes
+`~/.tock/calendars` for other programs: one calendar that is on per line,
+with its number, its kind and its name, split by tabs.
+
+Coming from a tock older than 0.1.47, which used SQLite? Run tock 0.1.53
+once first. It copies `tock.db` into `~/.tock/tock.ferrite/`; tock 0.2.0
+no longer reads SQLite.
 
 ## Google Calendar
 
@@ -164,7 +167,7 @@ An event you make, edit or delete on an Outlook calendar goes to Outlook.
 
 ## Dependencies
 
-Runtime: SQLite (bundled) or ferrite (built in). Optional: `notify-send` (notifications), `xclip` (clipboard).
+Runtime: nothing beyond the binary; ferrite is built in. Optional: `notify-send` (notifications), `xclip` (clipboard).
 
 ## Part of the Rust Terminal Suite
 

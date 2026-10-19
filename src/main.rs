@@ -363,7 +363,7 @@ struct App {
 
 impl App {
     fn new() -> Self {
-        let db = match Database::new(None) {
+        let db = match Database::new() {
             Ok(db) => Arc::new(db),
             Err(e) => {
                 // Most often a second tock: ferrite gives its files to
@@ -4261,9 +4261,9 @@ fn download_dir() -> std::path::PathBuf {
 }
 
 fn push_event_oneshot(event_id: i64) -> i32 {
-    let db = match Database::new(None) {
+    let db = match Database::new() {
         Ok(d) => d,
-        Err(e) => { eprintln!("could not open tock.db: {}", e); return 1; }
+        Err(e) => { eprintln!("could not open its database: {}", e); return 1; }
     };
     let evt = match db.get_event(event_id) {
         Ok(Some(e)) => e,

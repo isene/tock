@@ -1,12 +1,10 @@
-//! Where tock keeps its calendars and events.
+//! Where tock keeps its calendars and events: ferrite, the Fe₂O₃
+//! database that keeps its tables in memory, in `~/.tock/tock.ferrite/`.
 //!
-//! Two engines speak the same SQL here: ferrite, the Fe₂O₃ database
-//! that keeps its tables in memory and is the default, and SQLite.
-//! `database: sqlite` in `~/.tock/config.yml` picks the second. The
-//! first time ferrite opens, it copies everything out of `tock.db`,
-//! which is left as it was.
+//! Only one program may open the store, so tock also writes
+//! `~/.tock/calendars` for others to read (kastrup picks a calendar
+//! from it).
 
-use rusqlite::{types::ValueRef, Connection};
 use serde_json::Value as JsonValue;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -108,29 +106,23 @@ pub enum SyncResult {
 }
 
 // ---------------------------------------------------------------------------
-// Errors, from either engine
+// Errors
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
 pub enum Error {
-    Sqlite(rusqlite::Error),
     Ferrite(ferrite::Error),
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Sqlite(e) => write!(f, "{e}"),
             Error::Ferrite(e) => write!(f, "{e}"),
         }
     }
 }
 
 impl std::error::Error for Error {}
-
-impl From<rusqlite::Error> for Error {
-    fn from(e: rusqlite::Error) -> Self { Error::Sqlite(e) }
-}
 
 impl From<ferrite::Error> for Error {
     fn from(e: ferrite::Error) -> Self { Error::Ferrite(e) }
@@ -139,44 +131,20 @@ impl From<ferrite::Error> for Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 // ---------------------------------------------------------------------------
-// The two engines behind one door
+// The store
 // ---------------------------------------------------------------------------
 
-enum Store {
-    Sqlite(Connection),
-    Ferrite(ferrite::Db),
-}
+struct Store(ferrite::Db);
 
 impl Store {
     /// Run a statement that changes something. Gives how many rows.
     fn run(&mut self, sql: &str, params: &[Value]) -> Result<usize> {
-        match self {
-            Store::Sqlite(conn) => {
-                Ok(conn.execute(sql, rusqlite::params_from_iter(params.iter().map(to_sqlite)))?)
-            }
-            Store::Ferrite(db) => Ok(db.execute(sql, params)?.changed()),
-        }
+        Ok(self.0.execute(sql, params)?.changed())
     }
 
     /// Run a statement that reads, and give every row back.
     fn rows(&mut self, sql: &str, params: &[Value]) -> Result<Vec<Vec<Value>>> {
-        match self {
-            Store::Sqlite(conn) => {
-                let mut stmt = conn.prepare_cached(sql)?;
-                let width = stmt.column_count();
-                let mut rows = stmt.query(rusqlite::params_from_iter(params.iter().map(to_sqlite)))?;
-                let mut out = Vec::new();
-                while let Some(row) = rows.next()? {
-                    let mut one = Vec::with_capacity(width);
-                    for i in 0..width {
-                        one.push(from_sqlite(row.get_ref(i)?));
-                    }
-                    out.push(one);
-                }
-                Ok(out)
-            }
-            Store::Ferrite(db) => Ok(db.query(sql, params)?.rows().to_vec()),
-        }
+        Ok(self.0.query(sql, params)?.rows().to_vec())
     }
 
     /// The first row, if there is one.
@@ -190,38 +158,11 @@ impl Store {
     }
 
     fn batch(&mut self, sql: &str) -> Result<()> {
-        match self {
-            Store::Sqlite(conn) => Ok(conn.execute_batch(sql)?),
-            Store::Ferrite(db) => Ok(db.execute_batch(sql)?),
-        }
+        Ok(self.0.execute_batch(sql)?)
     }
 
     fn last_id(&self) -> i64 {
-        match self {
-            Store::Sqlite(conn) => conn.last_insert_rowid(),
-            Store::Ferrite(db) => db.last_insert_key(),
-        }
-    }
-}
-
-fn to_sqlite(v: &Value) -> rusqlite::types::Value {
-    use rusqlite::types::Value as S;
-    match v {
-        Value::Null => S::Null,
-        Value::Int(i) => S::Integer(*i),
-        Value::Real(r) => S::Real(*r),
-        Value::Text(t) => S::Text(t.clone()),
-        Value::Blob(b) => S::Blob(b.clone()),
-    }
-}
-
-fn from_sqlite(v: ValueRef<'_>) -> Value {
-    match v {
-        ValueRef::Null => Value::Null,
-        ValueRef::Integer(i) => Value::Int(i),
-        ValueRef::Real(r) => Value::Real(r),
-        ValueRef::Text(t) => Value::Text(String::from_utf8_lossy(t).into_owned()),
-        ValueRef::Blob(b) => Value::Blob(b.to_vec()),
+        self.0.last_insert_key()
     }
 }
 
@@ -272,6 +213,8 @@ fn opt_text(row: &[Value], i: usize) -> Option<String> {
 
 pub struct Database {
     store: Mutex<Store>,
+    /// `calendars` beside the store, the list other programs read.
+    list: PathBuf,
 }
 
 const SCHEMA: &str = "
@@ -353,18 +296,6 @@ const SCHEMA: &str = "
     CREATE INDEX IF NOT EXISTS idx_events_external ON events(calendar_id, external_id);
 ";
 
-/// The tables, in an order that puts every calendar before the events
-/// that point at it.
-const TABLES: &[&str] = &[
-    "schema_version",
-    "calendars",
-    "events",
-    "settings",
-    "weather_cache",
-    "astronomy_cache",
-    "notification_log",
-];
-
 /// An event with its calendar's name and colour, the way every reader
 /// wants it.
 const EVENT_COLUMNS: &str = "
@@ -377,54 +308,21 @@ const EVENT_COLUMNS: &str = "
     JOIN calendars c ON c.id = e.calendar_id";
 
 impl Database {
-    /// Open (or create) the database, apply the schema, and make sure a
-    /// default "Personal" calendar exists. `db_path` is the SQLite file;
-    /// ferrite keeps its files in a directory next to it.
-    pub fn new(db_path: Option<&str>) -> Result<Self> {
-        let path = match db_path {
-            Some(p) => PathBuf::from(p),
-            None => {
-                let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-                let dir = PathBuf::from(home).join(".tock");
-                std::fs::create_dir_all(&dir).ok();
-                dir.join("tock.db")
-            }
-        };
-        let engine = crate::config::Config::new().get_str("database", "ferrite");
-        Database::open(&path, &engine)
+    /// Open (or create) `~/.tock/tock.ferrite`, apply the schema, and
+    /// make sure a default "Personal" calendar exists.
+    pub fn new() -> Result<Self> {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        Database::open(&PathBuf::from(home).join(".tock").join("tock.ferrite"))
     }
 
-    /// Open the SQLite file at `path` with the engine named: `sqlite`,
-    /// or `ferrite`, whose files go in a directory next to it.
-    pub fn open(path: &Path, engine: &str) -> Result<Self> {
-        let (store, fresh) = if engine == "ferrite" {
-            let dir = path.with_extension("ferrite");
-            let fresh = !dir.join("log").exists();
-            (Store::Ferrite(ferrite::Db::open_with(&dir, ferrite::Durability::Full)?), fresh)
-        } else {
-            let conn = Connection::open(&path)?;
-            // WAL mode + 5 s busy timeout
-            conn.pragma_update(None, "journal_mode", "WAL")?;
-            conn.pragma_update(None, "busy_timeout", 5000)?;
-            conn.pragma_update(None, "foreign_keys", "ON")?;
-            (Store::Sqlite(conn), false)
-        };
-
-        let db = Database { store: Mutex::new(store) };
+    /// Open the store in the directory `dir`, made when missing.
+    pub fn open(dir: &Path) -> Result<Self> {
+        let store = Store(ferrite::Db::open_with(dir, ferrite::Durability::Full)?);
+        let db = Database { store: Mutex::new(store), list: dir.with_file_name("calendars") };
         db.create_schema()?;
-        if fresh && path.exists() {
-            db.import_from_sqlite(path)?;
-        }
         db.ensure_default_calendar()?;
+        db.list_calendars();
         Ok(db)
-    }
-
-    /// Which engine this is, for the status line.
-    pub fn engine(&self) -> &'static str {
-        match *self.store() {
-            Store::Sqlite(_) => "sqlite",
-            Store::Ferrite(_) => "ferrite",
-        }
     }
 
     fn store(&self) -> std::sync::MutexGuard<'_, Store> {
@@ -446,35 +344,6 @@ impl Database {
                 vals![now_secs()],
             )?;
         }
-        Ok(())
-    }
-
-    /// Copy every row of every table out of the SQLite file into a
-    /// ferrite that has just been made. The file is only read.
-    fn import_from_sqlite(&self, path: &Path) -> Result<()> {
-        let src = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        let mut s = self.store();
-        s.run("BEGIN", &[])?;
-        for table in TABLES {
-            let mut stmt = src.prepare(&format!("SELECT * FROM {table}"))?;
-            let names: Vec<String> = stmt.column_names().iter().map(|n| n.to_string()).collect();
-            let slots: Vec<String> = (1..=names.len()).map(|i| format!("?{i}")).collect();
-            let insert = format!(
-                "INSERT OR REPLACE INTO {table} ({}) VALUES ({})",
-                names.join(", "),
-                slots.join(", ")
-            );
-            let kinds = column_kinds(&s, table, &names);
-            let mut rows = stmt.query([])?;
-            while let Some(row) = rows.next()? {
-                let mut vals = Vec::with_capacity(names.len());
-                for (i, kind) in kinds.iter().enumerate() {
-                    vals.push(coerce(from_sqlite(row.get_ref(i)?), *kind));
-                }
-                s.run(&insert, &vals)?;
-            }
-        }
-        s.run("COMMIT", &[])?;
         Ok(())
     }
 
@@ -656,7 +525,10 @@ impl Database {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             vals![name, source_type, source_config, color, enabled as i64, now_secs()],
         )?;
-        Ok(s.last_id())
+        let id = s.last_id();
+        drop(s);
+        self.list_calendars();
+        Ok(id)
     }
 
     pub fn update_calendar_color(&self, id: i64, color: i64) -> Result<()> {
@@ -666,6 +538,7 @@ impl Database {
 
     pub fn toggle_calendar_enabled(&self, id: i64) -> Result<()> {
         self.store().run("UPDATE calendars SET enabled = 1 - enabled WHERE id = ?1", vals![id])?;
+        self.list_calendars();
         Ok(())
     }
 
@@ -673,7 +546,23 @@ impl Database {
         let mut s = self.store();
         s.run("DELETE FROM events WHERE calendar_id = ?1", vals![id])?;
         s.run("DELETE FROM calendars WHERE id = ?1", vals![id])?;
+        drop(s);
+        self.list_calendars();
         Ok(())
+    }
+
+    /// Write `calendars` beside the store: one enabled calendar a line,
+    /// its id, kind and name split by tabs. Only when the list changed,
+    /// and a failed write never stops tock.
+    fn list_calendars(&self) {
+        let Ok(mut cals) = self.get_calendars(true) else { return };
+        cals.sort_by_key(|c| c.id);
+        let text: String = cals.iter()
+            .map(|c| format!("{}\t{}\t{}\n", c.id, c.source_type, c.name.replace(['\t', '\n'], " ")))
+            .collect();
+        if std::fs::read_to_string(&self.list).is_ok_and(|old| old == text) { return; }
+        let tmp = self.list.with_extension("tmp");
+        if std::fs::write(&tmp, &text).is_ok() { let _ = std::fs::rename(&tmp, &self.list); }
     }
 
     pub fn update_calendar_sync(
@@ -859,41 +748,6 @@ fn date_to_ts(year: i32, month: u32, day: u32) -> i64 {
     days * 86400
 }
 
-/// What kind each named column of a table holds, so that a value read
-/// out of SQLite can be bent to fit. None for a column ferrite does not
-/// have, which is left as it is.
-fn column_kinds(s: &Store, table: &str, names: &[String]) -> Vec<Option<ferrite::Kind>> {
-    let Store::Ferrite(db) = s else { return vec![None; names.len()] };
-    let Ok(id) = db.table_id(table) else { return vec![None; names.len()] };
-    let t = db.table(id);
-    names
-        .iter()
-        .map(|n| {
-            if n == t.key_name() {
-                Some(ferrite::Kind::Int)
-            } else {
-                t.column_of(n).map(|i| t.columns()[i].kind)
-            }
-        })
-        .collect()
-}
-
-/// SQLite keeps whatever it was given; ferrite keeps what the column
-/// says. A "0" in an INTEGER column becomes 0, a 3 in a TEXT column
-/// becomes "3".
-fn coerce(v: Value, kind: Option<ferrite::Kind>) -> Value {
-    use ferrite::Kind;
-    match (kind, v) {
-        (Some(Kind::Int), Value::Text(t)) => t.trim().parse().map(Value::Int).unwrap_or(Value::Text(t)),
-        (Some(Kind::Int), Value::Real(r)) if r.fract() == 0.0 => Value::Int(r as i64),
-        (Some(Kind::Real), Value::Int(i)) => Value::Real(i as f64),
-        (Some(Kind::Real), Value::Text(t)) => t.trim().parse().map(Value::Real).unwrap_or(Value::Text(t)),
-        (Some(Kind::Text), Value::Int(i)) => Value::Text(i.to_string()),
-        (Some(Kind::Text), Value::Real(r)) => Value::Text(r.to_string()),
-        (_, v) => v,
-    }
-}
-
 /// Map one row of `EVENT_COLUMNS` to an `Event`.
 fn row_to_event(r: &[Value]) -> Event {
     Event {
@@ -934,7 +788,7 @@ fn json_opt_to_string(v: &Option<JsonValue>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    //! The same calls on both engines have to give the same answers.
+    //! What tock writes is what it reads back, after a reopen too.
     use super::*;
 
     struct Dir(PathBuf);
@@ -945,7 +799,7 @@ mod tests {
             std::fs::create_dir_all(&p).unwrap();
             Dir(p)
         }
-        fn db(&self) -> PathBuf { self.0.join("tock.db") }
+        fn store(&self) -> PathBuf { self.0.join("tock.ferrite") }
     }
     impl Drop for Dir {
         fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
@@ -974,7 +828,7 @@ mod tests {
         }
     }
 
-    /// Everything a reader can see, as text, so two engines can be
+    /// Everything a reader can see, as text, so two opens can be
     /// compared in one line.
     fn picture(db: &Database) -> String {
         let cals = db.get_calendars(false).unwrap();
@@ -984,137 +838,65 @@ mod tests {
     }
 
     #[test]
-    fn both_engines_tell_the_same_story() {
-        let dir = Dir::new("both");
-        // Build it up in SQLite first.
-        let sqlite = Database::open(&dir.db(), "sqlite").unwrap();
-        assert_eq!(sqlite.engine(), "sqlite");
+    fn every_change_is_there_after_a_reopen() {
+        let dir = Dir::new("reopen");
+        let db = Database::open(&dir.store()).unwrap();
         {
-            let mut s = sqlite.store();
+            let mut s = db.store();
             s.run("INSERT INTO calendars (name, source_type, color, enabled, created_at) VALUES ('Work', 'google', 12, 1, 5)", &[]).unwrap();
             s.run("INSERT INTO calendars (name, source_type, color, enabled, created_at) VALUES ('Off', 'local', 3, 0, 5)", &[]).unwrap();
         }
         for n in 1..=8 {
-            sqlite.save_event(&event(1 + n % 2, n)).unwrap();
+            db.save_event(&event(1 + n % 2, n)).unwrap();
         }
-        sqlite.set_weather_cache("{\"t\": 17}").unwrap();
-        sqlite.log_notification(1, 15).unwrap();
-
-        // Then ferrite copies it in.
-        let ferrite = Database::open(&dir.db(), "ferrite").unwrap();
-        assert_eq!(ferrite.engine(), "ferrite");
-        assert_eq!(picture(&ferrite), picture(&sqlite));
-
-        // And the same changes on both keep them the same.
-        for db in [&sqlite, &ferrite] {
-            let id = db.save_event(&event(1, 9)).unwrap();
-            assert_eq!(id, 9, "{}: the same key on both", db.engine());
-            let mut ev = event(1, 3);
-            ev.id = Some(3);
-            ev.title = "changed".into();
-            db.save_event(&ev).unwrap();
-            assert_eq!(db.upsert_synced_event(1, &event(1, 4)).unwrap(), SyncResult::Skipped);
-            assert_eq!(db.upsert_synced_event(2, &event(2, 40)).unwrap(), SyncResult::New);
-            assert!(db.event_exists(2, "ext-40").unwrap());
-            assert!(!db.event_exists(2, "ext-41").unwrap());
-            assert!(db.event_duplicate("event 5", 1_700_000_000 + 5 * 3600 + 30).unwrap());
-            assert_eq!(db.delete_event_series(7).unwrap(), 4, "the master and its three occurrences");
-            db.delete_event(2).unwrap();
-            db.toggle_calendar_enabled(3).unwrap();
-            db.update_calendar_color(2, 99).unwrap();
-            db.update_calendar_sync(2, 77, Some("{}")).unwrap();
-            assert_eq!(db.delete_event_by_external_id(2, "ext-40").unwrap(), 1);
-            db.set_weather_cache("{\"t\": 18}").unwrap();
-            db.log_notification(1, 15).unwrap();
-            db.clean_old_notifications().unwrap();
-            assert!(db.get_event(3).unwrap().is_some_and(|e| e.title == "changed"));
-            assert!(db.get_event(2).unwrap().is_none());
-            db.delete_calendar_with_events(2).unwrap();
-        }
-        assert_eq!(picture(&ferrite), picture(&sqlite));
-        assert_eq!(picture(&ferrite).matches("Event {").count(), 3, "events 3, 4 and 9 are left");
-
-        // Opening ferrite again does not copy a second time.
-        drop(ferrite);
-        let again = Database::open(&dir.db(), "ferrite").unwrap();
-        assert_eq!(picture(&again), picture(&sqlite));
+        db.set_weather_cache("{\"t\": 17}").unwrap();
+        db.log_notification(1, 15).unwrap();
+        let id = db.save_event(&event(1, 9)).unwrap();
+        assert_eq!(id, 9);
+        let mut ev = event(1, 3);
+        ev.id = Some(3);
+        ev.title = "changed".into();
+        db.save_event(&ev).unwrap();
+        assert_eq!(db.upsert_synced_event(1, &event(1, 4)).unwrap(), SyncResult::Skipped);
+        assert_eq!(db.upsert_synced_event(2, &event(2, 40)).unwrap(), SyncResult::New);
+        assert!(db.event_exists(2, "ext-40").unwrap());
+        assert!(!db.event_exists(2, "ext-41").unwrap());
+        assert!(db.event_duplicate("event 5", 1_700_000_000 + 5 * 3600 + 30).unwrap());
+        assert_eq!(db.delete_event_series(7).unwrap(), 4, "the master and its three occurrences");
+        db.delete_event(2).unwrap();
+        db.toggle_calendar_enabled(3).unwrap();
+        db.update_calendar_color(2, 99).unwrap();
+        db.update_calendar_sync(2, 77, Some("{}")).unwrap();
+        assert_eq!(db.delete_event_by_external_id(2, "ext-40").unwrap(), 1);
+        db.set_weather_cache("{\"t\": 18}").unwrap();
+        db.clean_old_notifications().unwrap();
+        assert!(db.get_event(3).unwrap().is_some_and(|e| e.title == "changed"));
+        assert!(db.get_event(2).unwrap().is_none());
+        db.delete_calendar_with_events(2).unwrap();
+        let before = picture(&db);
+        assert_eq!(before.matches("Event {").count(), 3, "events 3, 4 and 9 are left");
+        drop(db);
+        assert_eq!(picture(&Database::open(&dir.store()).unwrap()), before);
     }
 
-    /// The real thing, when it is there: this machine's own tock.db
-    /// copied into ferrite and read back the same. Run by hand with
-    /// `cargo test --release -- --ignored`.
     #[test]
-    #[ignore]
-    fn the_real_database_reads_the_same_through_both() {
-        let home = std::env::var("HOME").unwrap();
-        let real = PathBuf::from(home).join(".tock").join("tock.db");
-        if !real.exists() { return; }
-        let dir = Dir::new("real");
-        std::fs::copy(&real, dir.db()).unwrap();
-        let sqlite = Database::open(&dir.db(), "sqlite").unwrap();
-        let t0 = std::time::Instant::now();
-        let ferrite = Database::open(&dir.db(), "ferrite").unwrap();
-        let took = t0.elapsed();
-        // Compared field by field, and only the ids and field names are
-        // printed: what is in there is the user's own.
-        let by_id = |db: &Database| {
-            let mut c = db.get_calendars(false).unwrap();
-            c.sort_by_key(|c| c.id);
-            let mut e = db.get_events_in_range(0, i64::MAX).unwrap();
-            e.sort_by_key(|e| e.id);
-            (c, e)
-        };
-        let (sc, se) = by_id(&sqlite);
-        let (fc, fe) = by_id(&ferrite);
-        assert_eq!(sc.len(), fc.len(), "calendars");
-        for (a, b) in sc.iter().zip(&fc) {
-            let mut wrong = Vec::new();
-            if a.id != b.id { wrong.push("id"); }
-            if a.name != b.name { wrong.push("name"); }
-            if a.source_type != b.source_type { wrong.push("source_type"); }
-            if a.source_config != b.source_config { wrong.push("source_config"); }
-            if a.color != b.color { wrong.push("color"); }
-            if a.enabled != b.enabled { wrong.push("enabled"); }
-            assert!(wrong.is_empty(), "calendar {} differs in {wrong:?}", a.id);
-        }
-        assert_eq!(se.len(), fe.len(), "events");
-        for (a, b) in se.iter().zip(&fe) {
-            let mut wrong = Vec::new();
-            if a.id != b.id { wrong.push("id"); }
-            if a.calendar_id != b.calendar_id { wrong.push("calendar_id"); }
-            if a.external_id != b.external_id { wrong.push("external_id"); }
-            if a.title != b.title { wrong.push("title"); }
-            if a.description != b.description { wrong.push("description"); }
-            if a.location != b.location { wrong.push("location"); }
-            if a.start_time != b.start_time { wrong.push("start_time"); }
-            if a.end_time != b.end_time { wrong.push("end_time"); }
-            if a.all_day != b.all_day { wrong.push("all_day"); }
-            if a.timezone != b.timezone { wrong.push("timezone"); }
-            if a.recurrence_rule != b.recurrence_rule { wrong.push("recurrence_rule"); }
-            if a.series_master_id != b.series_master_id { wrong.push("series_master_id"); }
-            if a.status != b.status { wrong.push("status"); }
-            if a.organizer != b.organizer { wrong.push("organizer"); }
-            if a.attendees != b.attendees { wrong.push("attendees"); }
-            if a.my_status != b.my_status { wrong.push("my_status"); }
-            if a.alarms != b.alarms { wrong.push("alarms"); }
-            if a.metadata != b.metadata { wrong.push("metadata"); }
-            if a.calendar_name != b.calendar_name { wrong.push("calendar_name"); }
-            if a.calendar_color != b.calendar_color { wrong.push("calendar_color"); }
-            assert!(wrong.is_empty(), "event {} differs in {wrong:?}", a.id);
-        }
-        assert_eq!(sqlite.get_weather_cache().unwrap(), ferrite.get_weather_cache().unwrap());
-        eprintln!(
-            "{} calendars and {} events copied in and read back the same, {:.0} ms",
-            fc.len(),
-            fe.len(),
-            took.as_secs_f64() * 1e3
-        );
+    fn the_calendar_list_beside_the_store_follows_the_calendars() {
+        let dir = Dir::new("list");
+        let db = Database::open(&dir.store()).unwrap();
+        let list = || std::fs::read_to_string(dir.0.join("calendars")).unwrap();
+        assert_eq!(list(), "1\tlocal\tPersonal\n");
+        let work = db.add_calendar("Work\tday", "google", "{}", 12, true).unwrap();
+        assert_eq!(list(), "1\tlocal\tPersonal\n2\tgoogle\tWork day\n");
+        db.toggle_calendar_enabled(1).unwrap();
+        assert_eq!(list(), "2\tgoogle\tWork day\n");
+        db.delete_calendar_with_events(work).unwrap();
+        assert_eq!(list(), "");
     }
 }
 
 #[cfg(test)]
 mod startup {
-    //! How long opening takes, on copies of this machine's own files.
+    //! How long opening takes, on a copy of this machine's own store.
     //! Run by hand with `cargo test --release startup -- --ignored --nocapture`.
     use super::*;
 
@@ -1122,26 +904,23 @@ mod startup {
     #[ignore]
     fn how_long_an_open_takes() {
         let home = std::env::var("HOME").unwrap();
-        let real = PathBuf::from(home).join(".tock");
-        if !real.join("tock.db").exists() || !real.join("tock.ferrite").exists() { return; }
+        let real = PathBuf::from(home).join(".tock").join("tock.ferrite");
+        if !real.exists() { return; }
         let dir = std::env::temp_dir().join(format!("tock-open-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("tock.ferrite")).unwrap();
-        std::fs::copy(real.join("tock.db"), dir.join("tock.db")).unwrap();
         for f in ["log", "snapshot"] {
-            let _ = std::fs::copy(real.join("tock.ferrite").join(f), dir.join("tock.ferrite").join(f));
+            let _ = std::fs::copy(real.join(f), dir.join("tock.ferrite").join(f));
         }
-        for engine in ["sqlite", "ferrite"] {
-            let mut times = Vec::new();
-            for _ in 0..5 {
-                let t0 = std::time::Instant::now();
-                let db = Database::open(&dir.join("tock.db"), engine).unwrap();
-                let n = db.get_events_in_range(0, i64::MAX).unwrap().len();
-                times.push((t0.elapsed().as_secs_f64() * 1e3, n));
-            }
-            times.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-            eprintln!("{engine}: open and read every event, median of 5: {:.1} ms ({} events)", times[2].0, times[2].1);
+        let mut times = Vec::new();
+        for _ in 0..5 {
+            let t0 = std::time::Instant::now();
+            let db = Database::open(&dir.join("tock.ferrite")).unwrap();
+            let n = db.get_events_in_range(0, i64::MAX).unwrap().len();
+            times.push((t0.elapsed().as_secs_f64() * 1e3, n));
         }
+        times.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        eprintln!("open and read every event, median of 5: {:.1} ms ({} events)", times[2].0, times[2].1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
