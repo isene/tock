@@ -2935,6 +2935,16 @@ impl App {
         // unset; the launcher then tries Wayland, fails to connect,
         // and exits silently — leaving a zombie child behind.
         // Force the child's session type back to x11 in that case.
+        // A command to run and wait for first, such as one that turns the
+        // camera on, so a browser that starts now finds the camera.
+        let before = self.config.get_str("meeting_before", "");
+        let before_failed = !before.trim().is_empty() && !std::process::Command::new("sh")
+            .arg("-c").arg(&before)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status().map(|s| s.success()).unwrap_or(false);
+
         let mut cmd = std::process::Command::new(&launcher);
         cmd.arg(&url)
             .stdin(std::process::Stdio::null())
@@ -2951,7 +2961,8 @@ impl App {
             Ok(_) if !fallback => {
                 // xdg-open is only the messenger: name the browser it hands to.
                 let via = if launcher == "xdg-open" { default_browser().unwrap_or_else(|| "your browser".into()) } else { launcher.clone() };
-                self.show_feedback(&format!("Joining via {}…", via), 156)
+                let note = if before_failed { " (meeting_before failed)" } else { "" };
+                self.show_feedback(&format!("Joining via {}…{}", via, note), 156)
             }
             Ok(_) => {}  // already showed the fallback note above
             Err(e) => self.show_feedback(
@@ -3742,7 +3753,7 @@ impl App {
         lines.push(format!("  {}    {}    {}       {}", k("x/DEL"), d("Delete event"), k("a"), d("Accept invite")));
         lines.push(format!("  {}        {}   {}   {}", k("v"), d("View event details"), k("Ctrl+A"), d("Ask Claude")));
         lines.push(format!("  {}        {}", k("r"), d("Reply via Heathrow")));
-        lines.push(format!("  {}        {}", k("J"), d("Join meeting (per-host handler from config, else browser)")));
+        lines.push(format!("  {}        {}", k("J"), d("Join meeting (meeting_before, then per-host handler from config, else browser)")));
         lines.push(sep.clone());
         lines.push(format!("  {}  {}   {}  {}   {}  {}", k("i"), d("Import ICS"), k("G"), d("Google setup"), k("O"), d("Outlook setup")));
         lines.push(format!("  {}  {}     {}  {}      {}  {}", k("S"), d("Sync now"), k("C"), d("Calendars"), k("P"), d("Preferences")));

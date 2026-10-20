@@ -65,6 +65,7 @@ cp target/release/tock ~/.local/bin/
 | x/DEL | Delete event |
 | v | View event details |
 | a | Accept invite (RSVP) |
+| J | Join the meeting: runs `meeting_before` from the config first, if set |
 | Ctrl+Y | Copy event to clipboard |
 | Ctrl+A | A Claude session about the screen and the seven days from the selected one (`claude` on the PATH); `/exit` comes back |
 | i | Import ICS file |

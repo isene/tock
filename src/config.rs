@@ -69,6 +69,9 @@ colors:
   info_bg: 235
   status_bg: 235
 default_calendar: 1
+# A command the `J` key runs and waits for before it opens the meeting,
+# such as one that turns the camera on. Empty runs nothing.
+meeting_before: ""
 # Meeting launchers for the `J` (Join) key. Keys are host suffixes
 # matched against the meeting URL (so `us02web.zoom.us` resolves
 # under a `zoom.us` entry). Empty values force the xdg-open path.
