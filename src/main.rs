@@ -975,7 +975,12 @@ impl App {
 
     fn render_status_bar(&mut self) {
         let keys = "d/D:Day  w/W:Week  m/M:Month  y/Y:Year  e/E:Event  n:New  g:GoTo  /:Find  L:List  t:Today  i:Import  G:Google  O:Outlook  K:CalDAV  S:Sync  C:Cal  P:Prefs  ?:Help  q:Quit";
-        let version = format!("tock v{}", env!("CARGO_PKG_VERSION"));
+        let old = rebuilt();
+        let version = if old {
+            format!("tock v{} is old: restart", env!("CARGO_PKG_VERSION"))
+        } else {
+            format!("tock v{}", env!("CARGO_PKG_VERSION"))
+        };
         let w = self.cols as usize;
         // Right of the keys: the sync in progress, else a calendar that
         // could not sync, else nothing.
@@ -988,6 +993,7 @@ impl App {
         };
         let used = keys.len() + crust::display_width(&right) + version.len() + 3;
         let pad_len = w.saturating_sub(used).max(1);
+        let version = if old { style::bold(&style::fg(&version, 208)) } else { version };
         let text = format!(" {}{}{} {}", keys, " ".repeat(pad_len), right, version);
         self.status.set_text(&text);
         self.status.refresh();
@@ -4355,6 +4361,21 @@ fn push_event_oneshot(event_id: i64) -> i32 {
             1
         }
     }
+}
+
+
+/// True once a new build has replaced the program file this copy runs
+/// from: Linux then marks the running copy " (deleted)". One readlink
+/// per bar draw until it fires, none after.
+fn rebuilt() -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static OLD: AtomicBool = AtomicBool::new(false);
+    if OLD.load(Ordering::Relaxed) { return true; }
+    let old = std::fs::read_link("/proc/self/exe")
+        .map(|p| p.to_string_lossy().ends_with(" (deleted)"))
+        .unwrap_or(false);
+    if old { OLD.store(true, Ordering::Relaxed); }
+    old
 }
 
 fn main() {

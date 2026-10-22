@@ -33,6 +33,7 @@ Terminal calendar with week view, event management, astronomy, and weather. Buil
 - **Calendar manager**: enable/disable calendars, change colors, remove
 - **Kastrup integration**: reply to events via Kastrup (r key), jump to Kastrup (Z key)
 - **Database**: [ferrite](https://github.com/isene/ferrite) in ~/.tock/tock.ferrite/
+- **New build notice**: once a new build replaces the program, the version in the status bar turns orange and reads "is old: restart"
 
 ## Install
 
