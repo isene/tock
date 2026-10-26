@@ -353,6 +353,10 @@ struct App {
     sync_warning: Option<String>,
     poller_rx: mpsc::Receiver<poller::PollerEvent>,
     _poller_tx: mpsc::Sender<poller::PollerEvent>,
+    /// The day the weather was fetched for; a new day fetches it again.
+    weather_date: (i32, u32, u32),
+    /// Alarms fire to the minute, so they are checked once a minute.
+    last_notify_minute: i64,
 }
 
 impl App {
@@ -434,6 +438,8 @@ impl App {
             sync_warning: None,
             poller_rx: rx,
             _poller_tx: tx,
+            weather_date: today(),
+            last_notify_minute: -1,
         }
     }
 
@@ -4437,28 +4443,41 @@ pub fn run() {
 
     flush_stdin();
 
-    let mut weather_date = today();
-    // Notification alarms fire on minute precision (±1min window). No need
-    // to recheck on every idle wake.
-    let mut last_notify_minute: i64 = -1;
-
     while app.running {
-        let key = Input::getchr(Some(2));
+        let wait = app.before_wait();
+        let key = Input::getchr(Some(wait));
+        app.after_wait(key);
+    }
+
+    drop(poller);
+    Cursor::show();
+    Crust::cleanup();
+}
+
+impl App {
+    /// One turn of the main loop is `before_wait`, a wait of at most the
+    /// seconds it gives for a key, then `after_wait` with the key or None.
+    /// The tock program runs that loop in `run`; gluon runs the same.
+    pub fn before_wait(&mut self) -> u64 {
+        2
+    }
+
+    pub fn after_wait(&mut self, key: Option<String>) {
         if let Some(ref k) = key {
-            app.handle_input(k);
+            self.handle_input(k);
         } else {
             // Idle: check poller
-            while let Ok(ev) = app.poller_rx.try_recv() {
+            while let Ok(ev) = self.poller_rx.try_recv() {
                 match ev {
                     poller::PollerEvent::NeedsRefresh => {
-                        app.load_events_for_range();
-                        app.render_all();
+                        self.load_events_for_range();
+                        self.render_all();
                     }
                     poller::PollerEvent::SyncStatus(warning) => {
-                        if app.sync_warning != warning {
-                            app.sync_warning = warning;
-                            app.render_status_bar();
-                            if let Some(w) = app.sync_warning.clone() { app.show_feedback(&w, 196); }
+                        if self.sync_warning != warning {
+                            self.sync_warning = warning;
+                            self.render_status_bar();
+                            if let Some(w) = self.sync_warning.clone() { self.show_feedback(&w, 196); }
                         }
                     }
                 }
@@ -4466,30 +4485,26 @@ pub fn run() {
 
             // Check notifications only when the wall-clock minute changes.
             let cur_minute = crate::database::now_secs() / 60;
-            if cur_minute != last_notify_minute {
-                last_notify_minute = cur_minute;
-                let default_alarm = app.config.get_i64("notifications.default_alarm", 15);
-                notifications::check_and_notify(&app.db, default_alarm);
+            if cur_minute != self.last_notify_minute {
+                self.last_notify_minute = cur_minute;
+                let default_alarm = self.config.get_i64("notifications.default_alarm", 15);
+                notifications::check_and_notify(&self.db, default_alarm);
             }
 
             // Refresh weather on new day
             let t = today();
-            if weather_date != t {
-                weather_date = t;
-                app.weather_forecast.clear();
-                app.weather_fetched_at = 0;
-                app.load_events_for_range();
-                app.render_all();
+            if self.weather_date != t {
+                self.weather_date = t;
+                self.weather_forecast.clear();
+                self.weather_fetched_at = 0;
+                self.load_events_for_range();
+                self.render_all();
             }
 
             // Check heathrow goto file
-            app.check_heathrow_goto();
+            self.check_heathrow_goto();
         }
     }
-
-    drop(poller);
-    Cursor::show();
-    Crust::cleanup();
 }
 
 #[cfg(test)]
