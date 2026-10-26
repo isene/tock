@@ -316,7 +316,7 @@ fn format_date_short(y: i32, m: u32, d: u32) -> String {
 // App
 // =========================================================================
 
-struct App {
+pub struct App {
     db: Arc<Database>,
     config: config::Config,
     running: bool,
@@ -357,6 +357,11 @@ struct App {
     weather_date: (i32, u32, u32),
     /// Alarms fire to the minute, so they are checked once a minute.
     last_notify_minute: i64,
+    /// Syncs the calendars in the background; stopped in `finish`.
+    poller: Option<poller::Poller>,
+    /// Under gluon, the tab names that start the info line in place
+    /// of "Tock".
+    tab_line: Option<String>,
 }
 
 impl App {
@@ -440,6 +445,8 @@ impl App {
             _poller_tx: tx,
             weather_date: today(),
             last_notify_minute: -1,
+            poller: None,
+            tab_line: None,
         }
     }
 
@@ -889,7 +896,10 @@ impl App {
 
     fn render_info_bar(&mut self) {
         let (sy, sm, sd) = self.selected_date;
-        let title = style::bold(" Tock");
+        let title = match &self.tab_line {
+            Some(tabs) => tabs.clone(),
+            None => style::bold(" Tock"),
+        };
         let date_str = format!("  {}", format_date_long(sy, sm, sd));
 
         let phase = orbit::moon_phase(sy, sm, sd);
@@ -4378,7 +4388,10 @@ fn rebuilt() -> bool {
     old
 }
 
-pub fn run() {
+/// Everything before the main loop: the flags that answer and leave
+/// (None), the terminal, the store, the poller and the first paint.
+/// gluon calls it to start the calendar tab.
+pub fn start() -> Option<App> {
     // --help and --version answer before the TUI touches the terminal.
     // A tool that asks what this is — the fe2o3 launcher's ? popup, a
     // packaging script, a curious shell — should get an answer, not a
@@ -4394,11 +4407,11 @@ pub fn run() {
         println!();
         println!("Day / week / month / year views, sun, moon and planets, Google and Outlook");
         println!("sync. Drop .ics files in ~/.tock/incoming/ to import them.");
-        return;
+        return None;
     }
     if std::env::args().skip(1).any(|a| a == "-v" || a == "--version") {
         println!("tock {}", env!("CARGO_PKG_VERSION"));
-        return;
+        return None;
     }
 
     // CLI: `tock --push-event <id>` pushes a single local-only event to its
@@ -4435,21 +4448,31 @@ pub fn run() {
     app.render_all();
 
     // Start background poller
-    let poller = poller::Poller::start(
+    app.poller = Some(poller::Poller::start(
         app.db.clone(),
         &app.config,
         app._poller_tx.clone(),
-    );
+    ));
 
     flush_stdin();
 
+    Some(app)
+}
+
+/// The tock program: start, the main loop, finish.
+pub fn run() {
+    let Some(mut app) = start() else { return };
     while app.running {
         let wait = app.before_wait();
         let key = Input::getchr(Some(wait));
         app.after_wait(key);
     }
+    finish(app);
+}
 
-    drop(poller);
+/// Stop the poller and give the terminal back.
+pub fn finish(mut app: App) {
+    drop(app.poller.take());
     Cursor::show();
     Crust::cleanup();
 }
@@ -4461,6 +4484,21 @@ impl App {
     pub fn before_wait(&mut self) -> u64 {
         2
     }
+
+    /// Under gluon: the tab names to start the info line with.
+    pub fn set_tab_line(&mut self, tabs: Option<String>) {
+        self.tab_line = tabs;
+    }
+
+    /// Draw everything again from nothing, after another tab had the
+    /// screen; it also takes up a resize made meanwhile.
+    pub fn repaint(&mut self) {
+        Crust::clear_screen();
+        self.recreate_panes();
+        self.render_all();
+    }
+
+    pub fn running(&self) -> bool { self.running }
 
     pub fn after_wait(&mut self, key: Option<String>) {
         if let Some(ref k) = key {
