@@ -993,7 +993,9 @@ impl App {
     // ----- Status bar -----
 
     fn render_status_bar(&mut self) {
-        let keys = "d/D:Day  w/W:Week  m/M:Month  y/Y:Year  e/E:Event  n:New  g:GoTo  /:Find  L:List  t:Today  i:Import  G:Google  O:Outlook  K:CalDAV  S:Sync  C:Cal  P:Prefs  ?:Help  q:Quit";
+        // Under gluon, Q ends the whole app and q does nothing.
+        let quit = if self.tab_line.is_some() { "Q" } else { "q" };
+        let keys = format!("d/D:Day  w/W:Week  m/M:Month  y/Y:Year  e/E:Event  n:New  g:GoTo  /:Find  L:List  t:Today  i:Import  G:Google  O:Outlook  K:CalDAV  S:Sync  C:Cal  P:Prefs  ?:Help  {quit}:Quit");
         let old = rebuilt();
         let version = if old {
             format!("tock v{} is old: restart", env!("CARGO_PKG_VERSION"))
@@ -1694,7 +1696,8 @@ impl App {
             "P" => self.show_preferences(),
             "C-A" => self.claude(),
             "?" => self.show_help(),
-            "q" => self.running = false,
+            // Under gluon, gluon takes Q and q does nothing.
+            "q" if self.tab_line.is_none() => self.running = false,
             _ => {}
         }
     }
