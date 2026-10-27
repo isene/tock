@@ -1783,22 +1783,7 @@ impl App {
     pub fn event_text(&self, id: i64, start: i64) -> String {
         let Some(e) = self.db.get_events_in_range(start, start + 1).unwrap_or_default()
             .into_iter().find(|e| e.id == id && e.start_time == start) else { return String::new() };
-        let (y, m, d) = event_day(&e);
-        let mut out = format!("tock:{} {}, {}, {}\nCalendar: {}\n",
-            e.id, e.title, format_date_long(y, m, d), hours(&e), e.calendar_name);
-        if let Some(l) = e.location.as_deref().filter(|l| !l.is_empty()) {
-            out.push_str(&format!("Where: {l}\n"));
-        }
-        if let Some(o) = e.organizer.as_deref().filter(|o| !o.is_empty()) {
-            out.push_str(&format!("Organizer: {o}\n"));
-        }
-        if let Some(s) = e.my_status.as_deref() {
-            out.push_str(&format!("You: {}\n", humanize_status(s)));
-        }
-        if let Some(n) = e.description.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
-            out.push_str(&format!("\n{}\n", n.chars().take(3000).collect::<String>()));
-        }
-        out
+        event_details(&e)
     }
 
     /// Under gluon: the calendar on one event of its Home agenda, by the
@@ -4047,6 +4032,29 @@ fn humanize_status(status: &str) -> &str {
     }
 }
 
+/// One event as text for Claude or the clipboard: its reference, day and
+/// hours on the first line, then where, who, your answer and its text.
+fn event_details(e: &Event) -> String {
+    let (y, m, d) = event_day(e);
+    let mut out = format!("tock:{} {}, {}, {}\nCalendar: {}\n",
+        e.id, e.title, format_date_long(y, m, d), hours(e), e.calendar_name);
+    if let Some(l) = e.location.as_deref().filter(|l| !l.is_empty()) {
+        out.push_str(&format!("Where: {l}\n"));
+    }
+    if let Some(o) = e.organizer.as_deref().filter(|o| !o.is_empty()) {
+        out.push_str(&format!("Organizer: {o}\n"));
+    }
+    if let Some(s) = e.my_status.as_deref() {
+        out.push_str(&format!("You: {}\n", humanize_status(s)));
+    }
+    // The text of the description, without the HTML Outlook wraps it in.
+    let text = e.description.as_deref().map(clean_description).unwrap_or_default();
+    if !text.trim().is_empty() {
+        out.push_str(&format!("\n{}\n", text.trim().chars().take(3000).collect::<String>()));
+    }
+    out
+}
+
 fn clean_description(desc: &str) -> String {
     let desc = desc.to_string();
     // HTML → text (Outlook / Word descriptions). Order matters:
@@ -4677,6 +4685,21 @@ mod tests {
             series_master_id: None, status: String::new(), organizer: None,
             attendees: None, my_status: None, alarms: None, metadata: None,
             calendar_name: String::new(), calendar_color: 0,
+        }
+    }
+
+    #[test]
+    fn an_event_for_claude_has_the_text_of_its_description_but_no_html() {
+        let mut meet = ev(597, 0, 1800);
+        meet.title = "Status".into();
+        meet.description = Some(
+            "<html><head><style>p { font-family: Calibri; }</style></head>\
+             <body><p>Agenda: the <b>budget</b></p><a href=\"https://example.com/x\">Join</a></body></html>".into());
+        let text = event_details(&meet);
+        assert!(text.starts_with("tock:597 Status, "), "{text}");
+        assert!(text.contains("Agenda: the budget"), "{text}");
+        for markup in ["<", "font-family", "Calibri"] {
+            assert!(!text.contains(markup), "{markup} is markup: {text}");
         }
     }
 
