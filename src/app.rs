@@ -312,6 +312,15 @@ fn format_date_short(y: i32, m: u32, d: u32) -> String {
     format!("{} {} {:02}, {}", weekday_short(wd), month_short(m), d, y)
 }
 
+/// One line of the agenda on gluon's Home tab.
+pub struct AgendaLine {
+    pub id: i64,
+    pub start: i64,
+    /// The first event of its day.
+    pub new_day: bool,
+    pub text: String,
+}
+
 // =========================================================================
 // App
 // =========================================================================
@@ -1750,16 +1759,37 @@ impl App {
     }
 
     /// Under gluon, for its Home tab: the events not over yet in the coming
-    /// 30 days, as `L` lists them, at most `n` lines `width` columns wide.
-    pub fn agenda_lines(&self, n: usize, width: usize) -> Vec<String> {
+    /// 30 days, at most `n`, each as `L` lists it, `width` columns wide.
+    pub fn agenda(&self, n: usize, width: usize) -> Vec<AgendaLine> {
         let now = database::now_secs();
         let (y, m, d) = today();
         let from = from_local(date_to_ts(y, m, d, 0, 0, 0));
         let events: Vec<Event> = self.db.get_events_in_range(from, from + 30 * 86400).unwrap_or_default()
             .into_iter().filter(|e| e.end_time > now).take(n).collect();
-        events.iter().enumerate()
-            .map(|(i, e)| event_list_line(e, false, i > 0 && event_day(e) == event_day(&events[i - 1]), width))
-            .collect()
+        events.iter().enumerate().map(|(i, e)| {
+            let same_day = i > 0 && event_day(e) == event_day(&events[i - 1]);
+            AgendaLine { id: e.id, start: e.start_time, new_day: !same_day, text: event_list_line(e, false, same_day, width) }
+        }).collect()
+    }
+
+    /// Under gluon: the calendar on one event of its Home agenda, by the
+    /// event's id and start (a repeating event has one id for every time).
+    pub fn show_event(&mut self, id: i64, start: i64) {
+        let found = self.db.get_events_in_range(start, start + 1).unwrap_or_default()
+            .into_iter().find(|e| e.id == id && e.start_time == start);
+        if let Some(evt) = found {
+            self.select_event(&evt);
+        }
+    }
+
+    /// The day, the event and the time slot of `evt` selected.
+    fn select_event(&mut self, evt: &Event) {
+        self.selected_date = event_day(evt);
+        self.allday_count_date = None;
+        self.load_events_for_range();
+        self.selected_event_index = self.events_on_selected_day().iter()
+            .position(|e| e.id == evt.id).unwrap_or(0);
+        self.move_slot_to_event(evt);
     }
 
     /// `L`: the coming 30 days as one list.
@@ -1853,12 +1883,7 @@ impl App {
         self.recreate_panes();
         if let Some(i) = picked {
             let evt = events[i].clone();
-            self.selected_date = event_day(&evt);
-            self.allday_count_date = None;
-            self.load_events_for_range();
-            self.selected_event_index = self.events_on_selected_day().iter()
-                .position(|e| e.id == evt.id).unwrap_or(0);
-            self.move_slot_to_event(&evt);
+            self.select_event(&evt);
         }
         self.render_all();
     }
