@@ -4606,8 +4606,11 @@ impl App {
     /// One turn of the main loop is `before_wait`, a wait of at most the
     /// seconds it gives for a key, then `after_wait` with the key or None.
     /// The tock program runs that loop in `run`; gluon runs the same.
+    /// The wait ends when the next minute starts: the idle checks (alarms,
+    /// a new day, the poller's news, kastrup's goto file) need no more.
+    /// A 2 s tick was 30 wakes a minute.
     pub fn before_wait(&mut self) -> u64 {
-        2
+        60 - (crate::database::now_secs() % 60) as u64
     }
 
     /// Under gluon: the tab names to start the info line with.
