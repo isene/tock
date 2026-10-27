@@ -4512,8 +4512,9 @@ fn rebuilt() -> bool {
 
 /// Everything before the main loop: the flags that answer and leave
 /// (None), the terminal, the store, the poller and the first paint.
-/// gluon calls it to start the calendar tab.
-pub fn start() -> Option<App> {
+/// gluon calls it to start the calendar tab, with `paint` false: gluon
+/// draws Home first and calls repaint() when the calendar tab shows.
+pub fn start(paint: bool) -> Option<App> {
     // --help and --version answer before the TUI touches the terminal.
     // A tool that asks what this is — the fe2o3 launcher's ? popup, a
     // packaging script, a curious shell — should get an answer, not a
@@ -4567,7 +4568,9 @@ pub fn start() -> Option<App> {
         app.load_events_for_range();
     }
 
-    app.render_all();
+    if paint {
+        app.render_all();
+    }
 
     // Start background poller
     app.poller = Some(poller::Poller::start(
@@ -4583,7 +4586,7 @@ pub fn start() -> Option<App> {
 
 /// The tock program: start, the main loop, finish.
 pub fn run() {
-    let Some(mut app) = start() else { return };
+    let Some(mut app) = start(true) else { return };
     while app.running {
         let wait = app.before_wait();
         let key = Input::getchr(Some(wait));
