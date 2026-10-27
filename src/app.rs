@@ -1749,6 +1749,19 @@ impl App {
         ctx
     }
 
+    /// Under gluon, for its Home tab: the events not over yet in the coming
+    /// 30 days, as `L` lists them, at most `n` lines `width` columns wide.
+    pub fn agenda_lines(&self, n: usize, width: usize) -> Vec<String> {
+        let now = database::now_secs();
+        let (y, m, d) = today();
+        let from = from_local(date_to_ts(y, m, d, 0, 0, 0));
+        let events: Vec<Event> = self.db.get_events_in_range(from, from + 30 * 86400).unwrap_or_default()
+            .into_iter().filter(|e| e.end_time > now).take(n).collect();
+        events.iter().enumerate()
+            .map(|(i, e)| event_list_line(e, false, i > 0 && event_day(e) == event_day(&events[i - 1]), width))
+            .collect()
+    }
+
     /// `L`: the coming 30 days as one list.
     fn show_agenda(&mut self) {
         let (y, m, d) = today();
