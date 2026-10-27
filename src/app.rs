@@ -222,6 +222,16 @@ fn month_short(m: u32) -> &'static str {
     }
 }
 
+/// An event's hours, as "09:30-10:15", or "all day".
+fn hours(e: &Event) -> String {
+    if e.all_day {
+        return "all day".into();
+    }
+    let (_, _, _, h1, m1, _) = ts_to_parts(to_local(e.start_time));
+    let (_, _, _, h2, m2, _) = ts_to_parts(to_local(e.end_time));
+    format!("{h1:02}:{m1:02}-{h2:02}:{m2:02}")
+}
+
 fn format_date_long(y: i32, m: u32, d: u32) -> String {
     let wd = cwday(y, m, d);
     format!("{}, {} {:02}, {}", weekday_long(wd), month_name(m), d, y)
@@ -1741,14 +1751,7 @@ impl App {
                 ctx.push_str("  nothing\n");
             }
             for e in events {
-                let when = if e.all_day {
-                    "all day".to_string()
-                } else {
-                    let (_, _, _, h1, m1, _) = ts_to_parts(to_local(e.start_time));
-                    let (_, _, _, h2, m2, _) = ts_to_parts(to_local(e.end_time));
-                    format!("{h1:02}:{m1:02}-{h2:02}:{m2:02}")
-                };
-                ctx.push_str(&format!("  {when}  {} ({})", e.title, e.calendar_name));
+                ctx.push_str(&format!("  {}  {} ({})", hours(e), e.title, e.calendar_name));
                 if let Some(l) = e.location.as_deref().filter(|l| !l.is_empty()) {
                     ctx.push_str(&format!(" at {l}"));
                 }
@@ -1773,6 +1776,29 @@ impl App {
             let same_day = i > 0 && event_day(e) == event_day(&events[i - 1]);
             AgendaLine { id: e.id, start: e.start_time, new_day: !same_day, text: event_list_line(e, false, same_day, width) }
         }).collect()
+    }
+
+    /// Under gluon: one event, by its id and start, for Claude. The first
+    /// line is "tock:<id> title, day, hours", which gluon's y copies.
+    pub fn event_text(&self, id: i64, start: i64) -> String {
+        let Some(e) = self.db.get_events_in_range(start, start + 1).unwrap_or_default()
+            .into_iter().find(|e| e.id == id && e.start_time == start) else { return String::new() };
+        let (y, m, d) = event_day(&e);
+        let mut out = format!("tock:{} {}, {}, {}\nCalendar: {}\n",
+            e.id, e.title, format_date_long(y, m, d), hours(&e), e.calendar_name);
+        if let Some(l) = e.location.as_deref().filter(|l| !l.is_empty()) {
+            out.push_str(&format!("Where: {l}\n"));
+        }
+        if let Some(o) = e.organizer.as_deref().filter(|o| !o.is_empty()) {
+            out.push_str(&format!("Organizer: {o}\n"));
+        }
+        if let Some(s) = e.my_status.as_deref() {
+            out.push_str(&format!("You: {}\n", humanize_status(s)));
+        }
+        if let Some(n) = e.description.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+            out.push_str(&format!("\n{}\n", n.chars().take(3000).collect::<String>()));
+        }
+        out
     }
 
     /// Under gluon: the calendar on one event of its Home agenda, by the
