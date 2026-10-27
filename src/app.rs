@@ -275,6 +275,13 @@ fn event_list_line(evt: &Event, selected: bool, same_day: bool, width: usize) ->
     }
 }
 
+/// True when the event has a link to a Teams, Zoom or Meet meeting. A plain
+/// search, so the agenda stays cheap.
+fn has_meeting_link(e: &Event) -> bool {
+    [e.description.as_deref(), e.location.as_deref()].into_iter().flatten()
+        .any(|t| ["teams.microsoft.com/", "msteams:", "zoom.us/j/", "meet.google.com/"].iter().any(|h| t.contains(h)))
+}
+
 /// True when every word is in the event's title, place or description.
 /// `words` are lower case.
 fn event_has_words(evt: &Event, words: &[String]) -> bool {
@@ -329,6 +336,8 @@ pub struct AgendaLine {
     /// The first event of its day.
     pub new_day: bool,
     pub text: String,
+    /// It has a Teams, Zoom or Meet link, which `join` opens.
+    pub join: bool,
 }
 
 // =========================================================================
@@ -1774,7 +1783,7 @@ impl App {
             .into_iter().filter(|e| e.end_time > now).take(n).collect();
         events.iter().enumerate().map(|(i, e)| {
             let same_day = i > 0 && event_day(e) == event_day(&events[i - 1]);
-            AgendaLine { id: e.id, start: e.start_time, new_day: !same_day, text: event_list_line(e, false, same_day, width) }
+            AgendaLine { id: e.id, start: e.start_time, new_day: !same_day, text: event_list_line(e, false, same_day, width), join: has_meeting_link(e) }
         }).collect()
     }
 
@@ -1784,6 +1793,16 @@ impl App {
         let Some(e) = self.db.get_events_in_range(start, start + 1).unwrap_or_default()
             .into_iter().find(|e| e.id == id && e.start_time == start) else { return String::new() };
         event_details(&e)
+    }
+
+    /// Under gluon: J at Home's agenda, on one event by its id and start.
+    /// The answer says what happened, as tock's own J says it on its bar.
+    pub fn join(&self, id: i64, start: i64) -> String {
+        match self.db.get_events_in_range(start, start + 1).unwrap_or_default()
+            .into_iter().find(|e| e.id == id && e.start_time == start) {
+            Some(e) => self.join_event(&e).0,
+            None => "That event is no longer in the calendar".into(),
+        }
     }
 
     /// Under gluon: the calendar on one event of its Home agenda, by the
@@ -2944,15 +2963,19 @@ impl App {
             Some(e) => e,
             None => { self.show_feedback("No event at this time slot", 245); return; }
         };
+        let (note, colour) = self.join_event(&evt);
+        self.show_feedback(&note, colour);
+    }
+
+    /// The meeting of `evt` opened, and a note on how, in its colour.
+    fn join_event(&self, evt: &Event) -> (String, u8) {
         let haystack = {
             let desc = evt.description.as_deref().unwrap_or("");
             let loc  = evt.location.as_deref().unwrap_or("");
             format!("{}\n{}", desc, loc)
         };
         let Some(url) = extract_meeting_url(&haystack) else {
-            self.show_feedback(
-                "No meeting URL found in description or location", 245);
-            return;
+            return ("No meeting URL found in description or location".into(), 245);
         };
 
         // Walk meeting_handlers from longest suffix to shortest so
@@ -2987,13 +3010,9 @@ impl App {
         // isn't on PATH, drop down to xdg-open with a status note so
         // the user knows what happened.
         let (launcher, fallback) = match configured {
-            Some(cmd) if which_on_path(&cmd) => (cmd, false),
-            Some(cmd) => {
-                self.show_feedback(
-                    &format!("{} not in PATH, opening in browser…", cmd), 245);
-                ("xdg-open".to_string(), true)
-            }
-            None => ("xdg-open".to_string(), false),
+            Some(cmd) if which_on_path(&cmd) => (cmd, None),
+            Some(cmd) => ("xdg-open".to_string(), Some(format!("{} not in PATH, opening in browser…", cmd))),
+            None => ("xdg-open".to_string(), None),
         };
 
         // GUI launchers like teams-for-linux (Electron) trust
@@ -3025,16 +3044,15 @@ impl App {
             cmd.env("ELECTRON_OZONE_PLATFORM_HINT", "x11");
         }
         let spawned = cmd.spawn();
-        match spawned {
-            Ok(_) if !fallback => {
+        match (spawned, fallback) {
+            (Ok(_), None) => {
                 // xdg-open is only the messenger: name the browser it hands to.
                 let via = if launcher == "xdg-open" { default_browser().unwrap_or_else(|| "your browser".into()) } else { launcher.clone() };
                 let note = if before_failed { " (meeting_before failed)" } else { "" };
-                self.show_feedback(&format!("Joining via {}…{}", via, note), 156)
+                (format!("Joining via {}…{}", via, note), 156)
             }
-            Ok(_) => {}  // already showed the fallback note above
-            Err(e) => self.show_feedback(
-                &format!("Couldn't launch {}: {}", launcher, e), 196),
+            (Ok(_), Some(note)) => (note, 245),
+            (Err(e), _) => (format!("Couldn't launch {}: {}", launcher, e), 196),
         }
     }
 
@@ -4736,6 +4754,19 @@ mod tests {
         for markup in ["<", "font-family", "Calibri"] {
             assert!(!text.contains(markup), "{markup} is markup: {text}");
         }
+    }
+
+    #[test]
+    fn an_event_with_a_meeting_link_can_be_joined() {
+        let mut e = ev(1, 0, 1800);
+        assert!(!has_meeting_link(&e));
+        e.description = Some("Notes: https://example.com/notes".into());
+        assert!(!has_meeting_link(&e), "a plain link is no meeting");
+        e.location = Some("https://us02web.zoom.us/j/123".into());
+        assert!(has_meeting_link(&e));
+        e.location = None;
+        e.description = Some("<a href=\"https://teams.microsoft.com/l/meetup-join/19%3aabc\">Click here</a>".into());
+        assert!(has_meeting_link(&e));
     }
 
     #[test]

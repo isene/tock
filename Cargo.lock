@@ -671,7 +671,7 @@ dependencies = [
 
 [[package]]
 name = "tock"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "fe2o3-crust",
  "fe2o3-ferrite",
