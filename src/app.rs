@@ -4047,10 +4047,29 @@ fn event_details(e: &Event) -> String {
     if let Some(s) = e.my_status.as_deref() {
         out.push_str(&format!("You: {}\n", humanize_status(s)));
     }
-    // The text of the description, without the HTML Outlook wraps it in.
-    let text = e.description.as_deref().map(clean_description).unwrap_or_default();
-    if !text.trim().is_empty() {
-        out.push_str(&format!("\n{}\n", text.trim().chars().take(3000).collect::<String>()));
+    // The text of the description, without the HTML Outlook wraps it in,
+    // the blank lines, or Teams' own block at the end (help and download
+    // links, the ID); its link comes back as one Join line.
+    let raw = e.description.as_deref().unwrap_or("");
+    let clean = clean_description(raw);
+    let mut text = Vec::new();
+    for l in clean.lines().map(str::trim) {
+        if l.starts_with("____") || (l.starts_with("Microsoft Teams") && l.len() <= 30) {
+            break;
+        }
+        if !l.is_empty() {
+            text.push(l);
+        }
+    }
+    let text: String = text.join("\n").chars().take(3000).collect();
+    let place = e.location.as_deref().unwrap_or("");
+    if let Some(url) = extract_meeting_url(&format!("{raw}\n{place}")).map(|u| u.replace("&amp;", "&")) {
+        if !text.contains(&url) {
+            out.push_str(&format!("Join: {url}\n"));
+        }
+    }
+    if !text.is_empty() {
+        out.push_str(&format!("\n{text}\n"));
     }
     out
 }
@@ -4704,6 +4723,25 @@ mod tests {
     }
 
     #[test]
+    fn an_event_for_claude_keeps_the_join_link_but_not_teams_own_lines() {
+        let mut meet = ev(456, 0, 1800);
+        meet.title = "Review".into();
+        meet.description = Some(
+            "<html><body><p>  We go through the plans.</p><p>&nbsp;</p><p>\
+             Notes: https://example.com/notes</p><p>&nbsp;</p>\
+             <p>Microsoft Teams meeting</p><p>Join on your computer, mobile app or room device</p>\
+             <a href=\"https://teams.microsoft.com/l/meetup-join/19%3aabc?a=1&amp;b=2\">Click here to join the meeting</a>\
+             <p>Meeting ID: 123 456</p><p>Download Teams | Join on the web</p><p>Learn More | Meeting options</p>\
+             </body></html>".into());
+        let text = event_details(&meet);
+        assert!(text.contains("Join: https://teams.microsoft.com/l/meetup-join/19%3aabc?a=1&b=2\n"), "{text}");
+        assert!(text.ends_with("\nWe go through the plans.\nNotes: https://example.com/notes\n"), "{text}");
+        for gone in ["Click here", "Meeting ID", "Download Teams", "Learn More", "\n\n\n", "\n "] {
+            assert!(!text.contains(gone), "{gone:?} is still in: {text}");
+        }
+    }
+
+    #[test]
     fn find_reads_the_title_the_place_and_the_text_but_no_html() {
         let words = |typed: &str| -> Vec<String> { typed.split_whitespace().map(str::to_lowercase).collect() };
         let mut lunch = ev(1, 0, 3600);
@@ -4815,3 +4853,4 @@ mod tests {
         assert_eq!(url_host("not a url"), None);
     }
 }
+
