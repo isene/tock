@@ -4022,7 +4022,9 @@ fn rsvp_marker(my_status: Option<&str>) -> &'static str {
 
 fn humanize_status(status: &str) -> &str {
     match status {
-        "needsAction" => "Needs response",
+        // ICS and Outlook names for an invite you have not answered.
+        "needsAction" | "notResponded" | "none" => "Not answered",
+        "organizer" => "Organizer",
         "accepted" => "Accepted",
         "declined" => "Declined",
         "tentative" | "tentativelyAccepted" => "Tentative",
@@ -4036,8 +4038,11 @@ fn humanize_status(status: &str) -> &str {
 /// hours on the first line, then where, who, your answer and its text.
 fn event_details(e: &Event) -> String {
     let (y, m, d) = event_day(e);
-    let mut out = format!("tock:{} {}, {}, {}\nCalendar: {}\n",
-        e.id, e.title, format_date_long(y, m, d), hours(e), e.calendar_name);
+    let mut out = format!("tock:{} {}, {}, {}\n", e.id, e.title, format_date_long(y, m, d), hours(e));
+    // Outlook's own calendar is called "Calendar", which says nothing.
+    if !e.calendar_name.is_empty() && e.calendar_name != "Calendar" {
+        out.push_str(&format!("Calendar: {}\n", e.calendar_name));
+    }
     if let Some(l) = e.location.as_deref().filter(|l| !l.is_empty()) {
         out.push_str(&format!("Where: {l}\n"));
     }
@@ -4716,6 +4721,8 @@ mod tests {
     fn an_event_for_claude_has_the_text_of_its_description_but_no_html() {
         let mut meet = ev(597, 0, 1800);
         meet.title = "Status".into();
+        meet.calendar_name = "Calendar".into();
+        meet.my_status = Some("notResponded".into());
         meet.description = Some(
             "<html><head><style>p { font-family: Calibri; }</style></head>\
              <body><p>Agenda: the <b>budget</b></p><a href=\"https://example.com/x\">Join</a>\
@@ -4723,6 +4730,8 @@ mod tests {
         let text = event_details(&meet);
         assert!(text.starts_with("tock:597 Status, "), "{text}");
         assert!(text.contains("Agenda: the budget"), "{text}");
+        assert!(!text.contains("Calendar:"), "the default calendar's name says nothing: {text}");
+        assert!(text.contains("\nYou: Not answered\n"), "{text}");
         assert!(text.contains("\n- Where we are\n- Questions\n"), "a list stays a list: {text}");
         for markup in ["<", "font-family", "Calibri"] {
             assert!(!text.contains(markup), "{markup} is markup: {text}");
