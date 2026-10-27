@@ -1708,7 +1708,7 @@ impl App {
         }
     }
 
-    fn claude_context(&self) -> String {
+    pub fn claude_context(&self) -> String {
         let (sy, sm, sd) = self.selected_date;
         let (ty, tm, td) = today();
         let mut ctx = format!(
