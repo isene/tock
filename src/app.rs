@@ -4054,7 +4054,7 @@ fn event_details(e: &Event) -> String {
     let clean = clean_description(raw);
     let mut text = Vec::new();
     for l in clean.lines().map(str::trim) {
-        if l.starts_with("____") || (l.starts_with("Microsoft Teams") && l.len() <= 30) {
+        if l.starts_with("Microsoft Teams") && l.len() <= 30 {
             break;
         }
         if !l.is_empty() {
@@ -4096,8 +4096,13 @@ fn clean_description(desc: &str) -> String {
             r"(?i)<br\s*/?>|</(?:p|div|li|tr|h[1-6]|ul|ol|table|blockquote)\s*>"
         ).unwrap();
         let desc = brk.replace_all(&desc, "\n");
+        // A list item starts a line with "- ", so it still reads as a list.
+        let item = regex::Regex::new(r"(?i)<li[^>]*>").unwrap();
+        let desc = item.replace_all(&desc, "\n- ");
         let tags = regex::Regex::new(r"<[^>]+>").unwrap();
-        tags.replace_all(&desc, "")
+        let desc = tags.replace_all(&desc, "");
+        let lead = regex::Regex::new(r"(?m)^- +").unwrap();
+        lead.replace_all(&desc, "- ")
             .replace("&nbsp;", " ")
             .replace("&amp;", "&")
             .replace("&lt;", "<")
@@ -4713,10 +4718,12 @@ mod tests {
         meet.title = "Status".into();
         meet.description = Some(
             "<html><head><style>p { font-family: Calibri; }</style></head>\
-             <body><p>Agenda: the <b>budget</b></p><a href=\"https://example.com/x\">Join</a></body></html>".into());
+             <body><p>Agenda: the <b>budget</b></p><a href=\"https://example.com/x\">Join</a>\
+             <ul><li style=\"x\">\n<div>Where we are</div></li><li><div>Questions</div></li></ul></body></html>".into());
         let text = event_details(&meet);
         assert!(text.starts_with("tock:597 Status, "), "{text}");
         assert!(text.contains("Agenda: the budget"), "{text}");
+        assert!(text.contains("\n- Where we are\n- Questions\n"), "a list stays a list: {text}");
         for markup in ["<", "font-family", "Calibri"] {
             assert!(!text.contains(markup), "{markup} is markup: {text}");
         }
