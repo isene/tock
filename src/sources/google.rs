@@ -372,33 +372,30 @@ impl GoogleCalendar {
         Some((all_events, cancelled))
     }
 
+    /// Make the event on Google; `notify` has Google mail the guests.
     pub fn create_event(
         &mut self,
         calendar_id: &str,
         event_data: &EventData,
+        notify: bool,
     ) -> Option<String> {
         let body = to_google_format(event_data);
-        let path = format!(
-            "/calendar/v3/calendars/{}/events",
-            url_encode(calendar_id),
-        );
+        let path = events_path(calendar_id, None, notify);
         let resp = self.api_post(&path, &body)?;
         resp.get("id").and_then(Value::as_str).map(String::from)
     }
 
+    /// Change the event on Google; true when Google took it.
     pub fn update_event(
         &mut self,
         calendar_id: &str,
         event_id: &str,
         event_data: &EventData,
-    ) {
+        notify: bool,
+    ) -> bool {
         let body = to_google_format(event_data);
-        let path = format!(
-            "/calendar/v3/calendars/{}/events/{}",
-            url_encode(calendar_id),
-            url_encode(event_id),
-        );
-        let _ = self.api_put(&path, &body);
+        let path = events_path(calendar_id, Some(event_id), notify);
+        self.api_put(&path, &body).is_some()
     }
 
     pub fn delete_event(
@@ -1017,6 +1014,28 @@ fn expand_tilde(path: &str) -> String {
     }
 }
 
+/// Where an event goes. Google mails the guests only when the path
+/// asks it to with `sendUpdates=all`.
+fn events_path(calendar_id: &str, event_id: Option<&str>, notify: bool) -> String {
+    let mut path = format!("/calendar/v3/calendars/{}/events", url_encode(calendar_id));
+    if let Some(id) = event_id {
+        path.push('/');
+        path.push_str(&url_encode(id));
+    }
+    if notify {
+        path.push_str("?sendUpdates=all");
+    }
+    path
+}
+
+/// Whether Google should mail the guests of this event: yes for one of
+/// the user's own (made here, or organized by `account`), never for an
+/// imported file or someone else's meeting.
+pub fn mails_guests(event: &EventData, account: &str) -> bool {
+    let imported = event.metadata.as_ref().is_some_and(|m| m.get("ics_uid").is_some());
+    !imported && event.organizer.as_deref().map_or(true, |o| o.eq_ignore_ascii_case(account))
+}
+
 /// What went wrong, in Google's words when it sent any: "status 400:
 /// Invalid attendee email." beats a bare "status code 400".
 fn why(e: ureq::Error) -> String {
@@ -1041,6 +1060,29 @@ fn status_text(code: u16, body: &str) -> String {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+
+    #[test]
+    fn guests_are_mailed_for_own_events_only() {
+        assert_eq!(events_path("me@example.com", None, true),
+            "/calendar/v3/calendars/me%40example.com/events?sendUpdates=all");
+        assert_eq!(events_path("me@example.com", Some("abc"), false),
+            "/calendar/v3/calendars/me%40example.com/events/abc");
+        let mut ev = EventData {
+            id: None, calendar_id: 1, external_id: None, title: "Dinner".into(),
+            description: None, location: None, start_time: 0, end_time: 3600,
+            all_day: false, timezone: None, recurrence_rule: None, series_master_id: None,
+            status: "confirmed".into(), organizer: None, attendees: None, my_status: None,
+            alarms: None, metadata: None,
+        };
+        assert!(mails_guests(&ev, "me@example.com"));
+        ev.organizer = Some("Me@Example.com".into());
+        assert!(mails_guests(&ev, "me@example.com"));
+        ev.organizer = Some("boss@example.com".into());
+        assert!(!mails_guests(&ev, "me@example.com"));
+        ev.organizer = None;
+        ev.metadata = Some(json!({ "ics_uid": "x" }));
+        assert!(!mails_guests(&ev, "me@example.com"));
+    }
 
     #[test]
     fn a_refusal_names_what_google_said() {

@@ -118,6 +118,9 @@ page comes back to tock on a local port; nothing is pasted.
 Every calendar of the account is added. The main one is on and syncs at
 once; `C` turns on the others.
 
+Google mails the guests when you make or change an event of your own. An
+imported `.ics` or someone else's meeting goes up without mail.
+
 A web-type client works too. If it lists a return address on this machine
 (`http://localhost:8080/`, say), tock listens there. If it lists one
 elsewhere, tock asks you to paste the address the browser ends on, or just

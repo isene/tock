@@ -2015,12 +2015,15 @@ impl App {
                 if gc.get_access_token().is_none() {
                     return Push::Failed("Saved locally: Google auth failed - run S to re-auth".into());
                 }
+                let notify = sources::google::mails_guests(&data, email);
                 if let Some(ref existing_id) = data.external_id.clone() {
-                    // UPDATE existing remote event
-                    gc.update_event(google_cal_id, existing_id, &data);
+                    if !gc.update_event(google_cal_id, existing_id, &data, notify) {
+                        return Push::Failed(format!("Saved locally, Google update failed: {}",
+                            gc.last_error.as_deref().unwrap_or("unknown")));
+                    }
                 } else {
                     // CREATE new remote event; persist returned id back locally.
-                    if let Some(remote_id) = gc.create_event(google_cal_id, &data) {
+                    if let Some(remote_id) = gc.create_event(google_cal_id, &data, notify) {
                         data.id = Some(local_id);
                         data.external_id = Some(remote_id);
                         let _ = self.db.save_event(&data);
@@ -4521,7 +4524,7 @@ fn push_event_oneshot(event_id: i64) -> i32 {
         return 1;
     }
     println!("pushing event {} ('{}') to calendar {}...", evt.id, evt.title, google_cal_id);
-    match gc.create_event(google_cal_id, &data) {
+    match gc.create_event(google_cal_id, &data, sources::google::mails_guests(&data, email)) {
         Some(remote_id) => {
             let mut updated = data;
             updated.id = Some(evt.id);
