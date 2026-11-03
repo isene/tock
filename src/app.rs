@@ -390,6 +390,10 @@ pub struct App {
     /// Under gluon, the tab names that start the info line in place
     /// of "Tock".
     tab_line: Option<String>,
+    /// Under gluon, who a short name may be: kastrup's alias and mail
+    /// senders, as `Name <address>`. Without it a guest must be typed as
+    /// an address.
+    contacts: Option<Box<dyn Fn(&str) -> Vec<String>>>,
 }
 
 impl App {
@@ -475,6 +479,7 @@ impl App {
             last_notify_minute: -1,
             poller: None,
             tab_line: None,
+            contacts: None,
         }
     }
 
@@ -2282,15 +2287,7 @@ impl App {
 
         // Invitees
         self.blank_bottom(&style::bold(&style::fg(&format!(" {}", title), cal_color)));
-        let invitees_str = self.bottom_ask(" Invite (comma-separated emails, Enter to skip): ", "");
-        let attendees = if invitees_str.trim().is_empty() {
-            None
-        } else {
-            let arr: Vec<serde_json::Value> = invitees_str.split(',')
-                .map(|e| serde_json::json!({"email": e.trim()}))
-                .collect();
-            Some(serde_json::Value::Array(arr))
-        };
+        let attendees = self.ask_guests(" Invite (names or emails, comma-separated, Enter to skip): ", "");
 
         // Description
         self.blank_bottom(&style::bold(&style::fg(&format!(" {}", title), cal_color)));
@@ -2424,13 +2421,7 @@ impl App {
         // Invitees (prefill from current attendees' emails)
         let inv_def = sources::outlook::guest_addresses(evt.attendees.as_ref()).join(", ");
         self.blank_bottom(&style::bold(&format!(" {} — invitees", new_title)));
-        let inv_in = self.bottom_ask(" Invite (comma emails, Enter to skip): ", &inv_def);
-        let attendees = if inv_in.trim().is_empty() { None } else {
-            let arr: Vec<serde_json::Value> = inv_in.split(',')
-                .map(|e| serde_json::json!({"email": e.trim()}))
-                .collect();
-            Some(serde_json::Value::Array(arr))
-        };
+        let attendees = self.ask_guests(" Invite (names or emails, Enter to skip): ", &inv_def);
 
         // Description
         let description = if outlook_owns_text {
@@ -3893,6 +3884,61 @@ impl App {
         prompt_pane.ask(prompt, "")
     }
 
+    /// The guests of an event, asked in the bottom bar. A name without an
+    /// @ is looked up: one match is taken, several are offered by number,
+    /// and none asks for the address. A name that stays a name is left
+    /// out, since Google refuses the whole event over one such guest.
+    fn ask_guests(&mut self, prompt: &str, default: &str) -> Option<serde_json::Value> {
+        let typed = self.bottom_ask(prompt, default);
+        let mut emails = Vec::new();
+        for part in typed.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            let entry = if part.contains('@') { part.to_string() } else { self.find_guest(part) };
+            emails.extend(guest_emails(&entry));
+        }
+        if emails.is_empty() { return None; }
+        Some(serde_json::Value::Array(
+            emails.into_iter().map(|e| serde_json::json!({ "email": e })).collect()))
+    }
+
+    fn find_guest(&mut self, name: &str) -> String {
+        let found = self.contacts.as_ref().map(|f| f(name)).unwrap_or_default();
+        let picked = match found.len() {
+            0 => None,
+            1 => found.into_iter().next(),
+            _ => self.pick_guest(name, &found),
+        };
+        picked.unwrap_or_else(|| {
+            self.blank_bottom(&style::bold(&format!(" No address found for {name}")));
+            self.bottom_ask(&format!(" Address for {name} (Enter to leave out): "), "")
+        })
+    }
+
+    /// A numbered list of who `name` may be; a digit picks one, Esc types
+    /// the address instead.
+    fn pick_guest(&mut self, name: &str, found: &[String]) -> Option<String> {
+        let room = (self.bottom.h as usize).saturating_sub(3).clamp(1, 9).min(found.len());
+        let mut lines = vec![
+            style::fg(&"-".repeat(self.cols as usize), 238),
+            style::bold(&format!(" Who is {name}?")),
+        ];
+        for (i, f) in found.iter().take(room).enumerate() {
+            lines.push(format!(" {} {}", style::fg(&(i + 1).to_string(), 220), f));
+        }
+        lines.push(style::fg(" A number picks one, Esc types the address", 245));
+        while lines.len() < self.bottom.h as usize {
+            lines.push(String::new());
+        }
+        self.bottom.set_text(&lines.join("\n"));
+        self.bottom.full_refresh();
+        loop {
+            let key = Input::getchr(None)?;
+            if key == "ESC" { return None; }
+            if let Some(i) = key.parse::<usize>().ok().filter(|i| (1..=room).contains(i)) {
+                return Some(found[i - 1].clone());
+            }
+        }
+    }
+
     fn bottom_ask(&mut self, prompt: &str, default: &str) -> String {
         let prompt_y = self.bottom.y + 3;
         let mut prompt_pane = Pane::new(1, prompt_y, self.cols, 1, 255, 0);
@@ -4618,6 +4664,11 @@ impl App {
         self.tab_line = tabs;
     }
 
+    /// Where the guest prompts look up a name without an @.
+    pub fn set_contacts(&mut self, lookup: Box<dyn Fn(&str) -> Vec<String>>) {
+        self.contacts = Some(lookup);
+    }
+
     /// Draw everything again from nothing, after another tab had the
     /// screen; it also takes up a resize made meanwhile.
     pub fn repaint(&mut self) {
@@ -4673,9 +4724,35 @@ impl App {
     }
 }
 
+/// The addresses in one guest entry: `a@b.no`, `Name <a@b.no>`, or a list
+/// of those from an alias. A part with no @ is not an address and is left
+/// out.
+fn guest_emails(entry: &str) -> Vec<String> {
+    entry.split(',').filter_map(|part| {
+        let part = part.trim();
+        let addr = match (part.rfind('<'), part.rfind('>')) {
+            (Some(a), Some(b)) if a < b => &part[a + 1..b],
+            _ => part,
+        }.trim();
+        addr.contains('@').then(|| addr.to_string())
+    }).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_addresses_become_guests() {
+        assert_eq!(guest_emails("alice@example.com"), vec!["alice@example.com"]);
+        assert_eq!(guest_emails("Alice Ek <alice@example.com>"), vec!["alice@example.com"]);
+        // An alias can stand for a list, and a name can hold a comma.
+        assert_eq!(guest_emails("\"Ek, Alice\" <alice@example.com>, bob@example.com"),
+            vec!["alice@example.com", "bob@example.com"]);
+        // A short name left as it was typed never reaches Google.
+        assert!(guest_emails("bob").is_empty());
+        assert!(guest_emails("").is_empty());
+    }
 
     #[test]
     fn the_grid_keeps_the_morning_in_view() {

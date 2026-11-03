@@ -27,6 +27,7 @@ Terminal calendar with week view, event management, astronomy, and weather. Buil
 - **Weather**: 7-day forecast from Met.no (free, no API key)
 - **Desktop notifications**: configurable alarms via notify-send
 - **Event management**: create, edit, delete, accept invites (RSVP). A change on a Google, Outlook or CalDAV calendar goes to its server
+- **Guests**: type addresses, comma-separated. Under gluon a name works too: it is looked up in kastrup's aliases and mail, and several matches are offered by number
 - **Find**: `/` lists every event with the typed words in its title, place or description
 - **Agenda**: `L` lists the coming 30 days; Enter goes to the picked event
 - **Preferences**: 15 configurable settings with inline color picker (256-color grid)

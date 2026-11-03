@@ -507,7 +507,7 @@ impl GoogleCalendar {
                 }
             },
             Err(e) => {
-                self.last_error = Some(format!("GET {} failed: {}", url, e));
+                self.last_error = Some(why(e));
                 None
             }
         }
@@ -535,7 +535,7 @@ impl GoogleCalendar {
                 }
             },
             Err(e) => {
-                self.last_error = Some(format!("POST {} failed: {}", url, e));
+                self.last_error = Some(why(e));
                 None
             }
         }
@@ -563,7 +563,7 @@ impl GoogleCalendar {
                 }
             },
             Err(e) => {
-                self.last_error = Some(format!("PATCH {} failed: {}", url, e));
+                self.last_error = Some(why(e));
                 None
             }
         }
@@ -591,7 +591,7 @@ impl GoogleCalendar {
                 }
             },
             Err(e) => {
-                self.last_error = Some(format!("PUT {} failed: {}", url, e));
+                self.last_error = Some(why(e));
                 None
             }
         }
@@ -1017,10 +1017,37 @@ fn expand_tilde(path: &str) -> String {
     }
 }
 
+/// What went wrong, in Google's words when it sent any: "status 400:
+/// Invalid attendee email." beats a bare "status code 400".
+fn why(e: ureq::Error) -> String {
+    match e {
+        ureq::Error::Status(code, resp) => {
+            status_text(code, &resp.into_string().unwrap_or_default())
+        }
+        other => other.to_string(),
+    }
+}
+
+fn status_text(code: u16, body: &str) -> String {
+    let said = serde_json::from_str::<Value>(body).ok()
+        .and_then(|v| v.pointer("/error/message").and_then(Value::as_str).map(String::from));
+    match said {
+        Some(m) => format!("status {code}: {m}"),
+        None => format!("status {code}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+
+    #[test]
+    fn a_refusal_names_what_google_said() {
+        let body = r#"{"error":{"code":400,"message":"Invalid attendee email.","errors":[]}}"#;
+        assert_eq!(status_text(400, body), "status 400: Invalid attendee email.");
+        assert_eq!(status_text(502, "<html>Bad Gateway</html>"), "status 502");
+    }
 
     /// A browser coming back to the port: the request it sends, and the
     /// page it gets.
