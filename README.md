@@ -64,6 +64,7 @@ cp target/release/tock ~/.local/bin/
 | L | List the coming 30 days |
 | n | New event |
 | Enter | Edit event |
+| I | The guests alone: invite, take off |
 | x/DEL | Delete event |
 | v | View event details |
 | a | Accept invite (RSVP) |

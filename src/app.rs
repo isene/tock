@@ -16,7 +16,7 @@ enum Push {
 }
 
 use crust::{display_width, strip_ansi, Crust, Cursor, Input, Pane, style};
-use crate::database::{Database, Event, EventData};
+use crate::database::{Calendar, Database, Event, EventData};
 use std::collections::HashMap;
 use std::sync::{mpsc, Arc};
 use std::path::Path;
@@ -1700,6 +1700,7 @@ impl App {
             "J" => self.join_meeting(),
             "r" => self.reply_via_kastrup(),
             "i" => self.import_ics_file(),
+            "I" => self.edit_guests(),
             "G" => self.setup_google_calendar(),
             "O" => self.setup_outlook_calendar(),
             "K" => self.setup_caldav(),
@@ -2457,6 +2458,12 @@ impl App {
             metadata: evt.metadata.clone(),
         };
 
+        self.save_changed(&evt, data, cal_opt);
+    }
+
+    /// Store a changed event and push it to its calendar's source, as
+    /// Enter's edit and I's guests do.
+    fn save_changed(&mut self, evt: &Event, data: EventData, cal_opt: Option<Calendar>) {
         let local_id = match self.db.save_event(&data) {
             Ok(id) => id,
             Err(e) => {
@@ -2478,6 +2485,35 @@ impl App {
             Push::Sent => self.show_feedback("Event updated (synced)", 156),
             Push::Local => self.show_feedback("Event updated", 156),
         }
+    }
+
+    /// I: the guests of the event at the cursor and nothing else. The list
+    /// it has comes up to add to; the new guests get the invitation, as
+    /// after an edit. A list left as it was, or emptied, changes nothing.
+    fn edit_guests(&mut self) {
+        let evt = match self.event_at_selected_slot() {
+            Some(e) => e,
+            None => { self.show_feedback("No event at this time slot", 245); return; }
+        };
+        let had = sources::outlook::guest_addresses(evt.attendees.as_ref());
+        let default = if had.is_empty() { String::new() } else { format!("{}, ", had.join(", ")) };
+        self.blank_bottom(&style::bold(&format!(" {} \u{2014} guests", evt.title)));
+        let attendees = self.ask_guests(" Guests (names or emails, comma-separated): ", &default);
+        let now = sources::outlook::guest_addresses(attendees.as_ref());
+        let same = |a: &[String], b: &[String]| {
+            let low = |v: &[String]| v.iter().map(|x| x.to_lowercase()).collect::<std::collections::BTreeSet<_>>();
+            low(a) == low(b)
+        };
+        if attendees.is_none() || same(&had, &now) {
+            self.render_all();
+            self.show_feedback("Guests unchanged", 245);
+            return;
+        }
+        let cal_opt = self.db.get_calendars(false).ok()
+            .and_then(|cs| cs.into_iter().find(|c| c.id == evt.calendar_id));
+        let mut data = evt.data();
+        data.attendees = attendees;
+        self.save_changed(&evt, data, cal_opt);
     }
 
     fn delete_event(&mut self) {
@@ -3832,7 +3868,7 @@ impl App {
         lines.push(format!("  {}        {}       {}   {}", k("n"), d("New event"), k("ENTER"), d("Edit event")));
         lines.push(format!("  {}    {}    {}       {}", k("x/DEL"), d("Delete event"), k("a"), d("Accept invite")));
         lines.push(format!("  {}        {}   {}   {}", k("v"), d("View event details"), k("Ctrl+A"), d("Ask Claude")));
-        lines.push(format!("  {}        {}", k("r"), d("Reply via Heathrow")));
+        lines.push(format!("  {}        {}       {}        {}", k("r"), d("Reply via Heathrow"), k("I"), d("Guests: invite, take off")));
         lines.push(format!("  {}        {}", k("J"), d("Join meeting (meeting_before, then per-host handler from config, else browser)")));
         lines.push(sep.clone());
         lines.push(format!("  {}  {}   {}  {}   {}  {}", k("i"), d("Import ICS"), k("G"), d("Google setup"), k("O"), d("Outlook setup")));
