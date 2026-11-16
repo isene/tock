@@ -52,6 +52,12 @@ jobs:
           repository: isene/crust
           path: crust
 
+      - name: Checkout orbit
+        uses: actions/checkout@v7
+        with:
+          repository: isene/orbit
+          path: orbit
+
       - name: Checkout ferrite
         uses: actions/checkout@v7
         with:
