@@ -30,6 +30,7 @@ Terminal calendar with week view, event management, astronomy, and weather. Buil
 - **Guests**: type addresses, comma-separated. Under gluon a name works too: it is looked up in kastrup's aliases and mail, and several matches are offered by number
 - **Find**: `/` lists every event with the typed words in its title, place or description
 - **Agenda**: `L` lists the coming 30 days; Enter goes to the picked event
+- **Agenda in the shell**: `tock --agenda [DAYS]` prints the next 30 days (or DAYS), one event a line, ids included. It reads the store without taking it, so it works while tock or gluon runs
 - **Preferences**: 15 configurable settings with inline color picker (256-color grid)
 - **Calendar manager**: enable/disable calendars, change colors, remove
 - **Kastrup integration**: reply to events via Kastrup (r key), jump to Kastrup (Z key)

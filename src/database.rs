@@ -325,6 +325,13 @@ impl Database {
         Ok(db)
     }
 
+    /// Read the store in `dir` as it is now, while tock or gluon has it
+    /// open: no lock, and nothing is written, not even the schema.
+    pub fn read_only(dir: &Path) -> Result<Self> {
+        let store = Store(ferrite::Db::read_only(dir)?);
+        Ok(Database { store: Mutex::new(store), list: dir.with_file_name("calendars") })
+    }
+
     fn store(&self) -> std::sync::MutexGuard<'_, Store> {
         self.store.lock().unwrap()
     }
@@ -922,6 +929,22 @@ mod tests {
         assert_eq!(db.drop_synced_not_in(cal, 0, end, &sent).unwrap(), 1, "event 2 went");
         assert_eq!(all(cal), ["event 1", "event 3", "event 4"]);
         assert_eq!(all(other), ["event 2"], "another calendar is left alone");
+    }
+
+    #[test]
+    fn another_program_reads_the_events_while_tock_has_them_open() {
+        let dir = Dir::new("reader");
+        let db = Database::open(&dir.store()).unwrap();
+        let cal = db.add_calendar("Work", "outlook", "{}", 12, true).unwrap();
+        db.upsert_synced_event(cal, &event(cal, 1)).unwrap();
+        assert!(Database::open(&dir.store()).is_err(), "the lock is held");
+        let list = std::fs::read(dir.0.join("calendars")).unwrap();
+
+        let reader = Database::read_only(&dir.store()).unwrap();
+        let seen = reader.get_events_in_range(0, i64::MAX).unwrap();
+        assert_eq!(seen.iter().map(|e| (e.title.as_str(), e.calendar_name.as_str())).collect::<Vec<_>>(),
+            [("event 1", "Work")]);
+        assert_eq!(std::fs::read(dir.0.join("calendars")).unwrap(), list, "the reader wrote the list");
     }
 
     #[test]

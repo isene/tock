@@ -4570,6 +4570,42 @@ fn rebuilt() -> bool {
 /// (None), the terminal, the store, the poller and the first paint.
 /// gluon calls it to start the calendar tab, with `paint` false: gluon
 /// draws Home first and calls repaint() when the calendar tab shows.
+/// `tock --agenda [DAYS]`: the events from now to DAYS ahead, one a line.
+/// It reads the store without the lock, so it works while tock or gluon
+/// has it open, and it writes nothing.
+fn print_agenda(days: i64) -> i32 {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let dir = std::path::PathBuf::from(home).join(".tock").join("tock.ferrite");
+    let db = match Database::read_only(&dir) {
+        Ok(db) => db,
+        Err(e) => { eprintln!("tock: {e}"); return 1; }
+    };
+    let now = database::now_secs();
+    for e in db.get_events_in_range(now, now + days.max(1) * 86400).unwrap_or_default() {
+        println!("{}", agenda_line(&e));
+    }
+    0
+}
+
+/// `2026-11-25 Wed 10:00-10:45  Title  @ Place  (Work, calendar 9, event 1234)`.
+/// An all-day event is kept at UTC midnight, so its date is read as is.
+fn agenda_line(e: &Event) -> String {
+    let when = if e.all_day {
+        let (y, m, d, ..) = ts_to_parts(e.start_time);
+        let wd = (e.start_time.div_euclid(86400) + 3).rem_euclid(7) as u32 + 1;
+        format!("{y:04}-{m:02}-{d:02} {} all day", weekday_short(wd))
+    } else {
+        let start = to_local(e.start_time);
+        let (y, m, d, h, mi, _) = ts_to_parts(start);
+        let (_, _, _, eh, emi, _) = ts_to_parts(to_local(e.end_time));
+        let wd = (start.div_euclid(86400) + 3).rem_euclid(7) as u32 + 1;
+        format!("{y:04}-{m:02}-{d:02} {} {h:02}:{mi:02}-{eh:02}:{emi:02}", weekday_short(wd))
+    };
+    let place = e.location.as_deref().filter(|l| !l.trim().is_empty())
+        .map(|l| format!("  @ {}", l.trim())).unwrap_or_default();
+    format!("{when}  {}{place}  ({}, calendar {}, event {})", e.title, e.calendar_name, e.calendar_id, e.id)
+}
+
 pub fn start(paint: bool) -> Option<App> {
     // --help and --version answer before the TUI touches the terminal.
     // A tool that asks what this is — the fe2o3 launcher's ? popup, a
@@ -4583,6 +4619,8 @@ pub fn start(paint: bool) -> Option<App> {
         println!("  --compose-to ADDR   open a compose window to ADDR (via kastrup)");
         println!("  --subject TEXT      subject for --compose-to");
         println!("  --push-event FILE   import an ICS file and exit");
+        println!("  --agenda [DAYS]     print the events from now on (30 days), one a line,");
+        println!("                      while tock or gluon runs");
         println!();
         println!("Day / week / month / year views, sun, moon and planets, Google and Outlook");
         println!("sync. Drop .ics files in ~/.tock/incoming/ to import them.");
@@ -4597,6 +4635,10 @@ pub fn start(paint: bool) -> Option<App> {
     // remote calendar (one-shot, no TUI). Used to backfill events that were
     // created before remote write-back was wired.
     let args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = args.iter().position(|a| a == "--agenda") {
+        let days = args.get(pos + 1).and_then(|d| d.parse::<i64>().ok()).unwrap_or(30);
+        std::process::exit(print_agenda(days));
+    }
     if let Some(pos) = args.iter().position(|a| a == "--push-event") {
         if let Some(id_str) = args.get(pos + 1) {
             if let Ok(id) = id_str.parse::<i64>() {
@@ -4762,6 +4804,28 @@ mod tests {
         // A short name left as it was typed never reaches Google.
         assert!(guest_emails("bob").is_empty());
         assert!(guest_emails("").is_empty());
+    }
+
+    #[test]
+    fn an_agenda_line_has_the_day_the_time_the_place_and_the_ids() {
+        let mut e = Event {
+            id: 1234, calendar_id: 9, external_id: None, title: "Standup".into(),
+            description: None, location: Some(" Room 2 ".into()),
+            start_time: date_to_ts(2026, 11, 25, 0, 0, 0), end_time: date_to_ts(2026, 11, 26, 0, 0, 0),
+            all_day: true, timezone: None, recurrence_rule: None, series_master_id: None,
+            status: "confirmed".into(), organizer: None, attendees: None, my_status: None,
+            alarms: None, metadata: None, calendar_name: "Work".into(), calendar_color: 12,
+        };
+        assert_eq!(agenda_line(&e), "2026-11-25 Wed all day  Standup  @ Room 2  (Work, calendar 9, event 1234)");
+        // A timed event shows local time; no place leaves the @ out.
+        e.all_day = false;
+        e.location = None;
+        e.start_time = date_to_ts(2026, 11, 25, 9, 0, 0);
+        e.end_time = e.start_time + 45 * 60;
+        let (_, _, _, h, mi, _) = ts_to_parts(to_local(e.start_time));
+        let (_, _, _, eh, emi, _) = ts_to_parts(to_local(e.end_time));
+        assert_eq!(agenda_line(&e),
+            format!("2026-11-25 Wed {h:02}:{mi:02}-{eh:02}:{emi:02}  Standup  (Work, calendar 9, event 1234)"));
     }
 
     #[test]
