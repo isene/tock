@@ -108,7 +108,7 @@ dependencies = [
 
 [[package]]
 name = "fe2o3-crust"
-version = "0.1.77"
+version = "0.1.80"
 dependencies = [
  "crossterm",
  "libc",
@@ -673,7 +673,7 @@ dependencies = [
 
 [[package]]
 name = "tock"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "fe2o3-crust",
  "fe2o3-ferrite",

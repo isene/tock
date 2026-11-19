@@ -335,10 +335,10 @@ fn ts_to_rfc3339(ts: i64) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Outlook sync stub
+// Outlook sync
 // ---------------------------------------------------------------------------
 
-fn sync_outlook_calendar(
+pub(crate) fn sync_outlook_calendar(
     db: &Database,
     cal: &crate::database::Calendar,
     range_start: i64,
@@ -376,13 +376,24 @@ fn sync_outlook_calendar(
     };
 
     let mut any_new = false;
+    let mut sent = std::collections::HashSet::new();
     for mut ev in events {
         ev.calendar_id = cal.id;
+        if let Some(id) = &ev.external_id { sent.insert(id.clone()); }
         match db.upsert_synced_event(cal.id, &ev) {
             Ok(SyncResult::New) => any_new = true,
             Ok(SyncResult::Updated) => any_new = true,
             _ => {}
         }
+    }
+
+    // An occurrence cancelled in Outlook is simply no longer in the
+    // window Graph sends, so a row it did not send goes. A day in from
+    // each end: Graph places an all-day event in its own time zone, and
+    // one at the edge would otherwise go and come back.
+    let day = 86_400;
+    if let Ok(n) = db.drop_synced_not_in(cal.id, range_start + day, range_end - day, &sent) {
+        any_new |= n > 0;
     }
 
     // Stamp the sync time; the tokens went in before the fetch.

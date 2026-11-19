@@ -336,6 +336,8 @@ impl OutlookCalendar {
     // Event CRUD
     // -----------------------------------------------------------------------
 
+    /// Every event and occurrence in the window, or None when any page
+    /// fails.
     pub fn fetch_events(
         &mut self,
         time_min: &str,
@@ -350,10 +352,9 @@ impl OutlookCalendar {
         ));
 
         while let Some(ref path) = url {
-            let json = match self.api_get(path) {
-                Some(v) => v,
-                None => return if all_events.is_empty() { None } else { Some(all_events) },
-            };
+            // A page that fails fails the whole fetch: the sync drops every
+            // event it was not sent, so a list cut short must never reach it.
+            let json = self.api_get(path)?;
 
             if let Some(items) = json.get("value").and_then(Value::as_array) {
                 for item in items {
@@ -971,6 +972,15 @@ mod tests {
 
     fn body_of(request: &str) -> Value {
         serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_fetch_with_a_failed_page_gives_nothing() {
+        // The first page points on to a port where nobody answers.
+        let (mut oc, seen) = graph(1, r#"{"value":[{"id":"AAMk-1","subject":"Planning"}],
+            "@odata.nextLink":"http://127.0.0.1:1/me/calendarView?page=2"}"#);
+        assert!(oc.fetch_events("2026-11-01T00:00:00Z", "2026-12-01T00:00:00Z").is_none());
+        assert!(seen.join().unwrap()[0].starts_with("GET /me/calendarView?"));
     }
 
     #[test]

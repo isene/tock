@@ -3459,38 +3459,9 @@ impl App {
         }
 
         for cal in &outlook_cals {
-            let cfg_str = match &cal.source_config { Some(s) => s.clone(), None => continue };
-            let mut config: serde_json::Value = match serde_json::from_str(&cfg_str) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let mut oc = crate::sources::outlook::OutlookCalendar::new(&config);
-            if oc.refresh_access_token().is_none() {
-                let err = oc.last_error.as_deref().unwrap_or("sign-in failed");
-                failed.push(poller::sync_failure("Outlook", &cal.name, err));
-                continue;
-            }
-            let tmin = crate::sources::google::ts_to_rfc3339_pub(range_start);
-            let tmax = crate::sources::google::ts_to_rfc3339_pub(range_end);
-            if let Some(events) = oc.fetch_events(&tmin, &tmax) {
-                for mut ev in events {
-                    ev.calendar_id = cal.id;
-                    if let Ok(crate::database::SyncResult::New | crate::database::SyncResult::Updated) =
-                        self.db.upsert_synced_event(cal.id, &ev)
-                    {
-                        any_new = true;
-                    }
-                }
-                let new_cfg = if let Some(rt) = oc.get_refresh_token() {
-                    config["refresh_token"] = serde_json::json!(rt);
-                    if let Some(at) = oc.get_access_token_cached() {
-                        config["access_token"] = serde_json::json!(at);
-                    }
-                    Some(serde_json::to_string(&config).unwrap_or_default())
-                } else { None };
-                let _ = self.db.update_calendar_sync(cal.id, now, new_cfg.as_deref());
-            } else {
-                failed.push(poller::sync_failure("Outlook", &cal.name, oc.last_error.as_deref().unwrap_or("fetch failed")));
+            match poller::sync_outlook_calendar(&self.db, cal, range_start, range_end) {
+                Ok(n) => any_new |= n,
+                Err(e) => failed.push(e),
             }
         }
 

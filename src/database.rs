@@ -628,6 +628,27 @@ impl Database {
     // Sync helper
     // -----------------------------------------------------------------------
 
+    /// Delete this calendar's rows inside `[start, end)` whose remote id is
+    /// not in `sent`: the remote cancelled or deleted the event. A row with
+    /// no remote id (made here, not sent yet) stays.
+    pub fn drop_synced_not_in(
+        &self,
+        calendar_id: i64,
+        start: i64,
+        end: i64,
+        sent: &std::collections::HashSet<String>,
+    ) -> Result<usize> {
+        let mut dropped = 0;
+        for e in self.get_events_in_range(start, end)? {
+            if e.calendar_id != calendar_id { continue; }
+            let Some(ext) = e.external_id.as_deref() else { continue };
+            if !sent.contains(ext) {
+                dropped += self.delete_event_by_external_id(calendar_id, ext)?;
+            }
+        }
+        Ok(dropped)
+    }
+
     /// Insert, update, or skip an event coming from a remote sync source.
     pub fn upsert_synced_event(&self, calendar_id: i64, data: &EventData) -> Result<SyncResult> {
         let ext_id = match &data.external_id {
@@ -877,6 +898,30 @@ mod tests {
         assert_eq!(before.matches("Event {").count(), 3, "events 3, 4 and 9 are left");
         drop(db);
         assert_eq!(picture(&Database::open(&dir.store()).unwrap()), before);
+    }
+
+    #[test]
+    fn a_synced_row_the_remote_no_longer_sends_is_dropped() {
+        let dir = Dir::new("gone");
+        let db = Database::open(&dir.store()).unwrap();
+        let cal = db.add_calendar("Work", "outlook", "{}", 12, true).unwrap();
+        let other = db.add_calendar("Home", "outlook", "{}", 3, true).unwrap();
+        for n in 1..=4 {
+            db.upsert_synced_event(cal, &event(cal, n)).unwrap();
+        }
+        db.save_event(&event(cal, 3)).unwrap(); // no remote id: made here
+        db.upsert_synced_event(other, &event(other, 2)).unwrap();
+        let sent: std::collections::HashSet<String> = ["ext-1", "ext-4"].map(String::from).into();
+        let all = |cal: i64| {
+            db.get_events_in_range(0, i64::MAX).unwrap().into_iter()
+                .filter(|e| e.calendar_id == cal).map(|e| e.title).collect::<Vec<_>>()
+        };
+
+        // Event 4 is outside the window and stays, sent or not.
+        let end = 1_700_000_000 + 4 * 3600;
+        assert_eq!(db.drop_synced_not_in(cal, 0, end, &sent).unwrap(), 1, "event 2 went");
+        assert_eq!(all(cal), ["event 1", "event 3", "event 4"]);
+        assert_eq!(all(other), ["event 2"], "another calendar is left alone");
     }
 
     #[test]
