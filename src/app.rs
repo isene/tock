@@ -4711,6 +4711,12 @@ impl App {
         60 - (crate::database::now_secs() % 60) as u64
     }
 
+    /// Under gluon: the calendar that could not sync in the last cycle,
+    /// in plain words, as tock's own status bar shows it.
+    pub fn sync_warning(&self) -> Option<&str> {
+        self.sync_warning.as_deref()
+    }
+
     /// Under gluon: the tab names to start the info line with.
     pub fn set_tab_line(&mut self, tabs: Option<String>) {
         self.tab_line = tabs;
